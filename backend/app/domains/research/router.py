@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings, get_settings
 from app.core.errors import ConflictError
 from app.core.ownership import current_owner
+from app.core.rate_limit import check_rate_limit
 from app.core.responses import created, ok
 from app.db.session import get_db_session
 from app.domains.research import service as research_service
@@ -50,6 +51,12 @@ async def create_research_run(
     cancelled). The best candidate is NEVER published automatically.
     """
 
+    # Per-owner creation rate limit (cheap in-process sliding window):
+    # each accepted creation starts a bounded in-process run, so one
+    # client must not be able to flood the runner with new runs.
+    check_rate_limit(
+        f"research-create:{owner}", settings.research_max_creates_per_minute
+    )
     run = await research_service.validate_and_create(session, owner, settings, payload)
     await session.commit()  # commit before scheduling (runner owns a session)
     get_runner().submit(run.id)

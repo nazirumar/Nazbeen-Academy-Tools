@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -88,19 +89,32 @@ class TestEnvironmentConsistency:
 class TestGetSettings:
     def test_polluted_non_postgres_env_url_is_ignored(self, monkeypatch) -> None:
         """Frontend tooling (e.g. Prisma) may export a file: DATABASE_URL —
-        the backend must ignore it in favour of its own .env file."""
+        the backend must ignore it in favour of its own .env file.
+
+        The .env file is provisioned BY THE TEST (temporarily) so the case
+        never depends on ambient sandbox state; CWD is the backend directory
+        (pydantic-settings resolves ``env_file=".env"`` against it).
+        """
 
         from app.core import config as config_module
 
         polluted = "file:/home/z/other-tool/db.sqlite"
+        env_path = Path(config_module.__file__).resolve().parents[2] / ".env"
+        env_path.write_text(
+            "DATABASE_URL=postgresql+asyncpg://ta_user:pw@localhost:5432/ta_platform\n",
+            encoding="utf-8",
+        )
         monkeypatch.setenv("DATABASE_URL", polluted)
         monkeypatch.setenv("APP_ENV", "local")
         config_module.get_settings.cache_clear()
         try:
             settings = config_module.get_settings()
-            # backend/.env (committed template copy in this sandbox) supplies a
-            # postgres URL; the polluted file: value must never win.
-            assert settings.database_url.startswith(("postgresql://", "postgresql+asyncpg://"))
+            # backend/.env supplies a postgres URL; the polluted file: value
+            # must never win.
+            assert settings.database_url.startswith(
+                ("postgresql://", "postgresql+asyncpg://")
+            )
             assert polluted not in settings.database_url
         finally:
+            env_path.unlink(missing_ok=True)
             config_module.get_settings.cache_clear()

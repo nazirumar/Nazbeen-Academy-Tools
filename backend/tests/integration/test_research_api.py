@@ -1366,3 +1366,58 @@ class TestPersistenceAndOwnership:
             row = await session.get(ResearchRun, run_id)
             assert row.status == "failed"
             assert row.error["code"] == "RUNNER_RESTARTED"
+
+
+class TestCreationRateLimit:
+    """Per-owner creation rate limit on POST /research/optimization."""
+
+    async def _create_one(self, app_client, fake_mt5, name: str) -> dict:
+        detail = await create_strategy(app_client, name=name)
+        await seed_flat_candles(app_client, fake_mt5)
+        resp = await app_client.post(
+            RESEARCH,
+            json=holdout_payload(
+                detail,
+                parameters=[{"condition_id": "px", "field": "lookback", "values": [10]}],
+            ),
+        )
+        return resp
+
+    async def test_rate_limit_returns_429(self, app_client, fake_mt5, monkeypatch):
+        from app.core.config import get_settings
+
+        # Shrink the per-owner creation budget for this test only.
+        settings = get_settings()
+        monkeypatch.setattr(settings, "research_max_creates_per_minute", 2, raising=False)
+
+        first = await self._create_one(app_client, fake_mt5, "rs-rl-1")
+        assert first.status_code == 201, first.text
+        second = await self._create_one(app_client, fake_mt5, "rs-rl-2")
+        assert second.status_code == 201, second.text
+        third = await self._create_one(app_client, fake_mt5, "rs-rl-3")
+        assert third.status_code == 429, third.text
+        body = third.json()
+        assert body["error"]["code"] == "RATE_LIMITED"
+
+        # Other owners keep their own budget; reads stay unthrottled.
+        other = await self._create_one(app_client, fake_mt5, "rs-rl-4")
+        # Same default owner here — still limited.
+        assert other.status_code == 429, other.text
+        listing = await app_client.get(RESEARCH)
+        assert listing.status_code == 200, listing.text
+
+    async def test_rate_limit_window_slides(self, app_client, fake_mt5, monkeypatch):
+        """Old requests age out of the window (deterministic clock)."""
+
+        from app.core.rate_limit import check_rate_limit, reset_rate_limits
+
+        reset_rate_limits()
+        now = 1_000.0
+        # The return value is the REMAINING budget after each request.
+        assert check_rate_limit("t:1", 2, now=now) == 1
+        assert check_rate_limit("t:1", 2, now=now + 1) == 0
+        with pytest.raises(Exception):
+            check_rate_limit("t:1", 2, now=now + 2)
+        # 61 seconds later the window is empty again.
+        assert check_rate_limit("t:1", 2, now=now + 61) == 1
+        reset_rate_limits()

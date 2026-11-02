@@ -253,6 +253,13 @@ Saving a candidate as a draft version reuses the existing
 candidate can never bypass the Strategy Builder's validation and
 draft/publish lifecycle.
 
+Rate limiting: `POST /api/v1/research/optimization` (run creation) is
+throttled per owner with an in-process sliding window
+(`RESEARCH_MAX_CREATES_PER_MINUTE`, default 10/minute; HTTP 429 with
+code `RATE_LIMITED` when exceeded). Read and cancel endpoints are not
+throttled. Like every in-process guard here, the window is per-process
+state — multi-process deployments would need a shared store.
+
 ## 6. Known limits (documented, not hidden)
 
 * In-process execution only: runs do not survive restarts (startup

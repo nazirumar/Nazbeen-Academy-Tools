@@ -139,6 +139,11 @@ class Settings(BaseSettings):
     research_bootstrap_samples: int = Field(default=200, ge=0, le=2_000)
     # Concurrent in-process research executions (single-process runner).
     research_max_concurrent: int = Field(default=1, ge=1, le=4)
+    # Per-owner cap on NEW research runs per minute (creation rate limit).
+    # Each accepted creation starts a bounded but potentially long-running
+    # in-process run; the cap stops accidental floods. Read/cancel
+    # endpoints are not throttled (cheap, owner-scoped queries).
+    research_max_creates_per_minute: int = Field(default=10, ge=1, le=10_000)
 
     # --- AI research layer (Phase 7) -------------------------------------------------
     # The AI layer EXPLAINS existing deterministic analysis results; it never

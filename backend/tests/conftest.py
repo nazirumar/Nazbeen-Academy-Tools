@@ -21,6 +21,10 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 os.environ["APP_ENV"] = "test"
 os.environ["LOG_FORMAT"] = "console"
 os.environ.setdefault("CORS_ORIGINS", "")
+# The research creation rate limit defaults to a production-safe value;
+# the integration suite creates many runs per minute, so tests run with a
+# much higher cap and exercise the limiter explicitly (429 test).
+os.environ.setdefault("RESEARCH_MAX_CREATES_PER_MINUTE", "1000")
 
 
 @pytest.fixture(scope="session")
@@ -81,6 +85,11 @@ async def app_client(database_url: str):
     get_settings.cache_clear()
     settings = get_settings()
     init_engine(settings)
+
+    # In-process rate-limit windows must not leak across tests.
+    from app.core.rate_limit import reset_rate_limits
+
+    reset_rate_limits()
 
     # Truncate before the test runs (order: children first via CASCADE).
     async with get_engine().begin() as conn:
