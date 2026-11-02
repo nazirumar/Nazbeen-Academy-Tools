@@ -1,0 +1,75 @@
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16 — the only database of the platform.
+  # Credentials come from the .env file next to this compose file
+  # (see .env.example). CHANGE THE PASSWORD before any non-local use.
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${TA_DB_USER:-ta_user}
+      POSTGRES_PASSWORD: ${TA_DB_PASSWORD:-CHANGE_ME_strong_password}
+      POSTGRES_DB: ${TA_DB_NAME:-ta_platform}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ta_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TA_DB_USER:-ta_user} -d ${TA_DB_NAME:-ta_platform}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # ---------------------------------------------------------------------------
+  # FastAPI backend — applies migrations on start, then serves on :8000.
+  # ---------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      DATABASE_URL: postgresql://${TA_DB_USER:-ta_user}:${TA_DB_PASSWORD:-CHANGE_ME_strong_password}@db:5432/${TA_DB_NAME:-ta_platform}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      MARKET_DATA_PROVIDER: mt5
+      # The MetaTrader5 package cannot run inside Linux containers: the
+      # backend starts in the honest "disabled" mode here. For live MT5 data
+      # run the backend natively on the Windows host (see README).
+      MT5_ENABLED: ${MT5_ENABLED:-false}
+      # Phase 7 AI research layer (optional, disabled by default — the
+      # deterministic platform is fully usable without it). The key stays
+      # server-side and is never returned by any endpoint.
+      AI_ENABLED: ${AI_ENABLED:-false}
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_MODEL: ${AI_MODEL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_RATE_LIMIT_PER_MINUTE: ${AI_RATE_LIMIT_PER_MINUTE:-10}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Next.js frontend — standalone build, talks to the backend directly.
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        NEXT_PUBLIC_BACKEND_ORIGIN: ${NEXT_PUBLIC_BACKEND_ORIGIN:-http://localhost:8000}
+        NEXT_PUBLIC_BACKEND_PORT: "8000"
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  ta_pgdata:

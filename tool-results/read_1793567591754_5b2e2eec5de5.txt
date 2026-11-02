@@ -1,0 +1,853 @@
+     1→"""Strategy & category management service.
+     2→
+     3→Phase 3 responsibilities:
+     4→
+     5→* Ownership: every read/write is scoped to the requesting owner; foreign
+     6→  records raise NotFoundError (never an authorization oracle).
+     7→* Non-destructive organisation: categories are archived, never silently
+     8→  deleted while dependents exist.
+     9→* Draft/publish workflow: saving a rule set creates an immutable DRAFT
+    10→  version; publishing marks it as the strategy's published definition,
+    11→  superseding the previous one. Published definitions are never mutated.
+    12→* Duplication: deep-copy a strategy (metadata + latest rule set) as a new
+    13→  draft.
+    14→"""
+    15→
+    16→from __future__ import annotations
+    17→
+    18→import uuid
+    19→from typing import Any
+    20→
+    21→from sqlalchemy import func, select
+    22→from sqlalchemy.exc import IntegrityError
+    23→from sqlalchemy.ext.asyncio import AsyncSession
+    24→
+    25→from app.core.errors import (
+    26→    ConflictError,
+    27→    NotFoundError,
+    28→    RuleValidationFailedError,
+    29→    ValidationAppError,
+    30→)
+    31→from app.db.models import (
+    32→    DIRECTIONS as DB_DIRECTIONS,
+    33→    MODES as DB_MODES,
+    34→    STRATEGY_STATUSES,
+    35→    VERSION_STATUSES,
+    36→    Strategy,
+    37→    StrategyCategory,
+    38→    StrategyValidationResult,
+    39→    StrategyVersion,
+    40→)
+    41→from app.domains.strategies.rules import (
+    42→    RuleValidationError,
+    43→    RuleSet,
+    44→    validate_rule_set,
+    45→)
+    46→from app.domains.strategies.schemas import (
+    47→    CategoryCreate,
+    48→    CategoryUpdate,
+    49→    DuplicateStrategyRequest,
+    50→    RuleSetUpload,
+    51→    StrategyCreate,
+    52→    StrategyUpdate,
+    53→)
+    54→
+    55→_PAGE_SIZE_DEFAULT = 20
+    56→_PAGE_SIZE_MAX = 100
+    57→
+    58→
+    59→# --------------------------------------------------------------------------- #
+    60→# Categories (root categories and subcategories)
+    61→# --------------------------------------------------------------------------- #
+    62→
+    63→
+    64→def _category_dict(
+    65→    category: StrategyCategory,
+    66→    strategy_count: int,
+    67→    children: list[dict[str, Any]] | None = None,
+    68→) -> dict[str, Any]:
+    69→    return {
+    70→        "id": str(category.id),
+    71→        "name": category.name,
+    72→        "mode": category.mode,
+    73→        "description": category.description,
+    74→        "parent_id": str(category.parent_id) if category.parent_id else None,
+    75→        "is_archived": bool(category.is_archived),
+    76→        "created_at": category.created_at,
+    77→        "updated_at": category.updated_at,
+    78→        "strategy_count": strategy_count,
+    79→        "children": children or [],
+    80→    }
+    81→
+    82→
+    83→async def get_category_detail(
+    84→    session: AsyncSession, owner_id: str, category_id: uuid.UUID
+    85→) -> dict[str, Any]:
+    86→    """Fetch one category (root or subcategory) with its strategy count."""
+    87→
+    88→    category = await _get_category(session, owner_id, category_id)
+    89→    counts = await _strategy_counts(session, owner_id)
+    90→    return _category_dict(category, counts.get(category.id, 0))
+    91→
+    92→
+    93→async def list_categories(
+    94→    session: AsyncSession,
+    95→    owner_id: str,
+    96→    mode: str | None = None,
+    97→    include_archived: bool = False,
+    98→) -> list[dict[str, Any]]:
+    99→    """Root categories with nested subcategories (owner-scoped)."""
+   100→
+   101→    stmt = select(StrategyCategory).where(StrategyCategory.owner_id == owner_id)
+   102→    if mode:
+   103→        stmt = stmt.where(StrategyCategory.mode == mode)
+   104→    if not include_archived:
+   105→        stmt = stmt.where(StrategyCategory.is_archived.is_(False))
+   106→    categories = list((await session.scalars(stmt.order_by(StrategyCategory.created_at))).all())
+   107→    counts = await _strategy_counts(session, owner_id)
+   108→
+   109→    by_parent: dict[uuid.UUID | None, list[StrategyCategory]] = {}
+   110→    for c in categories:
+   111→        by_parent.setdefault(c.parent_id, []).append(c)
+   112→
+   113→    def build(category: StrategyCategory) -> dict[str, Any]:
+   114→        children = [
+   115→            build(child) for child in sorted(by_parent.get(category.id, []), key=lambda x: x.created_at)
+   116→        ]
+   117→        return _category_dict(category, counts.get(category.id, 0), children)
+   118→
+   119→    return [build(root) for root in by_parent.get(None, [])]
+   120→
+   121→
+   122→async def create_category(
+   123→    session: AsyncSession, owner_id: str, payload: CategoryCreate
+   124→) -> dict[str, Any]:
+   125→    parent: StrategyCategory | None = None
+   126→    if payload.parent_id is not None:
+   127→        parent = await _get_category(session, owner_id, payload.parent_id)
+   128→        if parent.is_archived:
+   129→            raise ValidationAppError(
+   130→                "Cannot create subcategories under an archived category.",
+   131→                code="CATEGORY_ARCHIVED",
+   132→            )
+   133→        if parent.mode != payload.mode:
+   134→            raise ValidationAppError(
+   135→                "Subcategory mode must match its parent category "
+   136→                f"('{parent.mode}' != '{payload.mode}').",
+   137→            )
+   138→        if parent.parent_id is not None:
+   139→            raise ValidationAppError(
+   140→                "Category nesting is limited to one subcategory level.",
+   141→                code="MAX_CATEGORY_DEPTH",
+   142→            )
+   143→    await _ensure_category_name_free(
+   144→        session, owner_id, payload.name, payload.mode, payload.parent_id
+   145→    )
+   146→    category = StrategyCategory(
+   147→        owner_id=owner_id,
+   148→        name=payload.name,
+   149→        mode=payload.mode,
+   150→        description=payload.description,
+   151→        parent_id=payload.parent_id,
+   152→    )
+   153→    session.add(category)
+   154→    await session.flush()
+   155→    await session.refresh(category)
+   156→    return _category_dict(category, 0)
+   157→
+   158→
+   159→async def update_category(
+   160→    session: AsyncSession, owner_id: str, category_id: uuid.UUID, payload: CategoryUpdate
+   161→) -> dict[str, Any]:
+   162→    category = await _get_category(session, owner_id, category_id)
+   163→    if payload.name is not None and payload.name != category.name:
+   164→        await _ensure_category_name_free(
+   165→            session, owner_id, payload.name, category.mode, category.parent_id
+   166→        )
+   167→        category.name = payload.name
+   168→    if payload.description is not None:
+   169→        category.description = payload.description
+   170→    await session.flush()
+   171→    await session.refresh(category)
+   172→    counts = await _strategy_counts(session, owner_id)
+   173→    return _category_dict(category, counts.get(category.id, 0))
+   174→
+   175→
+   176→async def archive_category(
+   177→    session: AsyncSession, owner_id: str, category_id: uuid.UUID
+   178→) -> dict[str, Any]:
+   179→    """Archive a category AND its subcategories (non-destructive)."""
+   180→
+   181→    category = await _get_category(session, owner_id, category_id)
+   182→    category.is_archived = True
+   183→    children = await session.scalars(
+   184→        select(StrategyCategory).where(StrategyCategory.parent_id == category_id)
+   185→    )
+   186→    archived_children = 0
+   187→    for child in children:
+   188→        child.is_archived = True
+   189→        archived_children += 1
+   190→    await session.flush()
+   191→    await session.refresh(category)
+   192→    result = _category_dict(category, (await _strategy_counts(session, owner_id)).get(category.id, 0))
+   193→    if archived_children:
+   194→        result["archived_subcategories"] = archived_children
+   195→    return result
+   196→
+   197→
+   198→async def unarchive_category(
+   199→    session: AsyncSession, owner_id: str, category_id: uuid.UUID
+   200→) -> dict[str, Any]:
+   201→    category = await _get_category(session, owner_id, category_id)
+   202→    category.is_archived = False
+   203→    await session.flush()
+   204→    await session.refresh(category)
+   205→    return _category_dict(
+   206→        category, (await _strategy_counts(session, owner_id)).get(category.id, 0)
+   207→    )
+   208→
+   209→
+   210→async def delete_category(
+   211→    session: AsyncSession, owner_id: str, category_id: uuid.UUID
+   212→) -> None:
+   213→    """Hard delete — refused while dependents exist (never silent)."""
+   214→
+   215→    category = await _get_category(session, owner_id, category_id)
+   216→    children = await session.scalars(
+   217→        select(StrategyCategory).where(StrategyCategory.parent_id == category_id)
+   218→    )
+   219→    if children.first() is not None:
+   220→        raise ConflictError(
+   221→            "Delete the subcategories of this category first.",
+   222→            code="CATEGORY_HAS_CHILDREN",
+   223→        )
+   224→    strategies = await session.scalars(
+   225→        select(Strategy).where(Strategy.category_id == category_id).limit(1)
+   226→    )
+   227→    if strategies.first() is not None:
+   228→        raise ConflictError(
+   229→            "This category still contains strategies. Move or delete them first.",
+   230→            code="CATEGORY_NOT_EMPTY",
+   231→        )
+   232→    await session.delete(category)
+   233→    await session.flush()
+   234→
+   235→
+   236→async def _get_category(
+   237→    session: AsyncSession, owner_id: str, category_id: uuid.UUID
+   238→) -> StrategyCategory:
+   239→    category = await session.get(StrategyCategory, category_id)
+   240→    if category is None or category.owner_id != owner_id:
+   241→        raise NotFoundError(f"Category '{category_id}' was not found.")
+   242→    return category
+   243→
+   244→
+   245→async def _ensure_category_name_free(
+   246→    session: AsyncSession,
+   247→    owner_id: str,
+   248→    name: str,
+   249→    mode: str,
+   250→    parent_id: uuid.UUID | None,
+   251→) -> None:
+   252→    stmt = select(StrategyCategory).where(
+   253→        StrategyCategory.owner_id == owner_id,
+   254→        StrategyCategory.name == name,
+   255→        StrategyCategory.mode == mode,
+   256→        StrategyCategory.parent_id.is_(None) if parent_id is None
+   257→        else StrategyCategory.parent_id == parent_id,
+   258→    )
+   259→    existing = await session.scalars(stmt)
+   260→    if existing.first() is not None:
+   261→        raise ConflictError(
+   262→            f"A category named '{name}' already exists at this level for mode '{mode}'.",
+   263→            code="CATEGORY_NAME_TAKEN",
+   264→        )
+   265→
+   266→
+   267→async def _strategy_counts(
+   268→    session: AsyncSession, owner_id: str
+   269→) -> dict[uuid.UUID, int]:
+   270→    rows = await session.execute(
+   271→        select(Strategy.category_id, func.count(Strategy.id))
+   272→        .where(
+   273→            Strategy.category_id.is_not(None),
+   274→            Strategy.owner_id == owner_id,
+   275→        )
+   276→        .group_by(Strategy.category_id)
+   277→    )
+   278→    return {row[0]: int(row[1]) for row in rows.all()}
+   279→
+   280→
+   281→# --------------------------------------------------------------------------- #
+   282→# Strategies
+   283→# --------------------------------------------------------------------------- #
+   284→
+   285→
+   286→def _strategy_dict(strategy: Strategy) -> dict[str, Any]:
+   287→    return {
+   288→        "id": str(strategy.id),
+   289→        "name": strategy.name,
+   290→        "mode": strategy.mode,
+   291→        "direction": strategy.direction,
+   292→        "status": strategy.status,
+   293→        "description": strategy.description,
+   294→        "category_id": str(strategy.category_id) if strategy.category_id else None,
+   295→        "current_version": strategy.current_version,
+   296→        "published_version_number": strategy.published_version_number,
+   297→        "created_at": strategy.created_at,
+   298→        "updated_at": strategy.updated_at,
+   299→    }
+   300→
+   301→
+   302→async def list_strategies(
+   303→    session: AsyncSession,
+   304→    owner_id: str,
+   305→    *,
+   306→    mode: str | None = None,
+   307→    category_id: uuid.UUID | None = None,
+   308→    status: str | None = None,
+   309→    include_archived: bool = False,
+   310→    page: int = 1,
+   311→    page_size: int = _PAGE_SIZE_DEFAULT,
+   312→) -> tuple[list[Strategy], dict[str, int]]:
+   313→    """Owner-scoped, paginated strategy listing.
+   314→
+   315→    Archived strategies are excluded unless ``include_archived`` or an
+   316→    explicit ``status`` filter (including ``status=archived``) is given.
+   317→    """
+   318→
+   319→    stmt = select(Strategy).where(Strategy.owner_id == owner_id)
+   320→    count_stmt = select(func.count(Strategy.id)).where(Strategy.owner_id == owner_id)
+   321→    if mode:
+   322→        stmt = stmt.where(Strategy.mode == mode)
+   323→        count_stmt = count_stmt.where(Strategy.mode == mode)
+   324→    if category_id:
+   325→        stmt = stmt.where(Strategy.category_id == category_id)
+   326→        count_stmt = count_stmt.where(Strategy.category_id == category_id)
+   327→    if status:
+   328→        stmt = stmt.where(Strategy.status == status)
+   329→        count_stmt = count_stmt.where(Strategy.status == status)
+   330→    elif not include_archived:
+   331→        stmt = stmt.where(Strategy.status != "archived")
+   332→        count_stmt = count_stmt.where(Strategy.status != "archived")
+   333→
+   334→    total = int((await session.execute(count_stmt)).scalar_one())
+   335→    page = max(1, page)
+   336→    page_size = min(max(1, page_size), _PAGE_SIZE_MAX)
+   337→    strategies = list(
+   338→        (
+   339→            await session.scalars(
+   340→                stmt.order_by(Strategy.updated_at.desc())
+   341→                .offset((page - 1) * page_size)
+   342→                .limit(page_size)
+   343→            )
+   344→        ).all()
+   345→    )
+   346→    meta = {
+   347→        "page": page,
+   348→        "page_size": page_size,
+   349→        "total": total,
+   350→        "pages": (total + page_size - 1) // page_size if total else 1,
+   351→    }
+   352→    return strategies, meta
+   353→
+   354→
+   355→async def create_strategy(
+   356→    session: AsyncSession, owner_id: str, payload: StrategyCreate
+   357→) -> Strategy:
+   358→    if payload.mode not in DB_MODES:
+   359→        raise ValidationAppError(
+   360→            f"Mode '{payload.mode}' is not supported. Supported: {', '.join(DB_MODES)}."
+   361→        )
+   362→    if payload.direction not in DB_DIRECTIONS:
+   363→        raise ValidationAppError(
+   364→            f"Direction '{payload.direction}' is not supported. "
+   365→            f"Supported: {', '.join(DB_DIRECTIONS)}."
+   366→        )
+   367→    if payload.category_id is not None:
+   368→        category = await _get_category(session, owner_id, payload.category_id)
+   369→        if category.mode != payload.mode:
+   370→            raise ValidationAppError(
+   371→                f"Strategy mode '{payload.mode}' does not match category mode "
+   372→                f"'{category.mode}'. Forex and Binary Options strategies are "
+   373→                "kept strictly separate.",
+   374→                code="MODE_MISMATCH",
+   375→            )
+   376→        if category.is_archived:
+   377→            raise ValidationAppError(
+   378→                "Cannot create strategies inside an archived category.",
+   379→                code="CATEGORY_ARCHIVED",
+   380→            )
+   381→    duplicate = await session.scalars(
+   382→        select(Strategy).where(
+   383→            Strategy.owner_id == owner_id,
+   384→            Strategy.name == payload.name,
+   385→            Strategy.mode == payload.mode,
+   386→            Strategy.category_id == payload.category_id,
+   387→        )
+   388→    )
+   389→    if duplicate.first() is not None:
+   390→        raise ConflictError(
+   391→            f"A strategy named '{payload.name}' already exists in this category.",
+   392→            code="STRATEGY_NAME_TAKEN",
+   393→        )
+   394→    strategy = Strategy(
+   395→        owner_id=owner_id,
+   396→        name=payload.name,
+   397→        mode=payload.mode,
+   398→        direction=payload.direction,
+   399→        description=payload.description,
+   400→        category_id=payload.category_id,
+   401→    )
+   402→    session.add(strategy)
+   403→    await session.flush()
+   404→    await session.refresh(strategy)
+   405→    return strategy
+   406→
+   407→
+   408→async def get_strategy(
+   409→    session: AsyncSession, owner_id: str, strategy_id: uuid.UUID
+   410→) -> Strategy:
+   411→    strategy = await session.get(Strategy, strategy_id)
+   412→    if strategy is None or strategy.owner_id != owner_id:
+   413→        raise NotFoundError(f"Strategy '{strategy_id}' was not found.")
+   414→    return strategy
+   415→
+   416→
+   417→async def get_strategy_detail(
+   418→    session: AsyncSession, owner_id: str, strategy_id: uuid.UUID
+   419→) -> dict[str, Any]:
+   420→    strategy = await get_strategy(session, owner_id, strategy_id)
+   421→    rule_set: dict[str, Any] | None = None
+   422→    summary: list[str] = []
+   423→    if strategy.current_version > 0:
+   424→        version = await session.scalars(
+   425→            select(StrategyVersion)
+   426→            .where(
+   427→                StrategyVersion.strategy_id == strategy.id,
+   428→                StrategyVersion.version == strategy.current_version,
+   429→            )
+   430→            .limit(1)
+   431→        )
+   432→        current = version.first()
+   433→        if current is not None:
+   434→            rule_set = current.rule_set
+   435→            try:
+   436→                summary = validate_rule_set(rule_set).summary_lines()
+   437→            except RuleValidationError:  # pragma: no cover - stored data is pre-validated
+   438→                summary = []
+   439→    return {
+   440→        "strategy": strategy,
+   441→        "rule_set": rule_set,
+   442→        "summary": summary,
+   443→    }
+   444→
+   445→
+   446→async def update_strategy(
+   447→    session: AsyncSession,
+   448→    owner_id: str,
+   449→    strategy_id: uuid.UUID,
+   450→    payload: StrategyUpdate,
+   451→) -> Strategy:
+   452→    strategy = await get_strategy(session, owner_id, strategy_id)
+   453→    if payload.category_id is not None and payload.category_id != strategy.category_id:
+   454→        category = await _get_category(session, owner_id, payload.category_id)
+   455→        if category.mode != strategy.mode:
+   456→            raise ValidationAppError(
+   457→                "Cannot move a strategy into a category of another mode.",
+   458→                code="MODE_MISMATCH",
+   459→            )
+   460→        if category.is_archived:
+   461→            raise ValidationAppError(
+   462→                "Cannot move a strategy into an archived category.",
+   463→                code="CATEGORY_ARCHIVED",
+   464→            )
+   465→        strategy.category_id = payload.category_id
+   466→    elif payload.category_id is None and "category_id" in payload.model_fields_set:
+   467→        strategy.category_id = None
+   468→    if payload.name is not None and payload.name != strategy.name:
+   469→        duplicate = await session.scalars(
+   470→            select(Strategy).where(
+   471→                Strategy.owner_id == owner_id,
+   472→                Strategy.name == payload.name,
+   473→                Strategy.mode == strategy.mode,
+   474→                Strategy.category_id == strategy.category_id,
+   475→                Strategy.id != strategy.id,
+   476→            )
+   477→        )
+   478→        if duplicate.first() is not None:
+   479→            raise ConflictError(
+   480→                f"A strategy named '{payload.name}' already exists in this category.",
+   481→                code="STRATEGY_NAME_TAKEN",
+   482→            )
+   483→        strategy.name = payload.name
+   484→    if payload.direction is not None:
+   485→        strategy.direction = payload.direction
+   486→    if payload.status is not None:
+   487→        strategy.status = payload.status
+   488→    if payload.description is not None:
+   489→        strategy.description = payload.description
+   490→    await session.flush()
+   491→    await session.refresh(strategy)
+   492→    return strategy
+   493→
+   494→
+   495→async def archive_strategy(
+   496→    session: AsyncSession, owner_id: str, strategy_id: uuid.UUID
+   497→) -> Strategy:
+   498→    strategy = await get_strategy(session, owner_id, strategy_id)
+   499→    strategy.status = "archived"
+   500→    await session.flush()
+   501→    await session.refresh(strategy)
+   502→    return strategy
+   503→
+   504→
+   505→async def unarchive_strategy(
+   506→    session: AsyncSession, owner_id: str, strategy_id: uuid.UUID
+   507→) -> Strategy:
+   508→    strategy = await get_strategy(session, owner_id, strategy_id)
+   509→    if strategy.published_version_number is not None:
+   510→        strategy.status = "active"
+   511→    else:
+   512→        strategy.status = "draft"
+   513→    await session.flush()
+   514→    await session.refresh(strategy)
+   515→    return strategy
+   516→
+   517→
+   518→async def delete_strategy(
+   519→    session: AsyncSession, owner_id: str, strategy_id: uuid.UUID
+   520→) -> None:
+   521→    strategy = await get_strategy(session, owner_id, strategy_id)
+   522→    await session.delete(strategy)  # versions cascade via FK
+   523→    await session.flush()
+   524→
+   525→
+   526→# --------------------------------------------------------------------------- #
+   527→# Duplication
+   528→# --------------------------------------------------------------------------- #
+   529→
+   530→
+   531→async def duplicate_strategy(
+   532→    session: AsyncSession,
+   533→    owner_id: str,
+   534→    strategy_id: uuid.UUID,
+   535→    payload: DuplicateStrategyRequest,
+   536→) -> tuple[Strategy, StrategyVersion | None]:
+   537→    source = await get_strategy(session, owner_id, strategy_id)
+   538→    name = (payload.name or f"Copy of {source.name}").strip()
+   539→    if len(name) > 160:
+   540→        raise ValidationAppError(
+   541→            "Duplicate name must not exceed 160 characters.",
+   542→            code="NAME_TOO_LONG",
+   543→        )
+   544→    duplicate_name = await session.scalars(
+   545→        select(Strategy).where(
+   546→            Strategy.owner_id == owner_id,
+   547→            Strategy.name == name,
+   548→            Strategy.mode == source.mode,
+   549→            Strategy.category_id == source.category_id,
+   550→        )
+   551→    )
+   552→    if duplicate_name.first() is not None:
+   553→        raise ConflictError(
+   554→            f"A strategy named '{name}' already exists in this category.",
+   555→            code="STRATEGY_NAME_TAKEN",
+   556→        )
+   557→
+   558→    duplicate = Strategy(
+   559→        owner_id=owner_id,
+   560→        name=name,
+   561→        mode=source.mode,
+   562→        direction=source.direction,
+   563→        description=source.description,
+   564→        category_id=source.category_id,
+   565→    )
+   566→    session.add(duplicate)
+   567→    await session.flush()
+   568→    await session.refresh(duplicate)
+   569→
+   570→    copied_version: StrategyVersion | None = None
+   571→    if payload.include_rule_set and source.current_version > 0:
+   572→        source_version = await session.scalars(
+   573→            select(StrategyVersion)
+   574→            .where(
+   575→                StrategyVersion.strategy_id == source.id,
+   576→                StrategyVersion.version == source.current_version,
+   577→            )
+   578→            .limit(1)
+   579→        )
+   580→        latest = source_version.first()
+   581→        if latest is not None:
+   582→            copied_version = StrategyVersion(
+   583→                strategy_id=duplicate.id,
+   584→                version=1,
+   585→                status="draft",
+   586→                rule_set=dict(latest.rule_set),
+   587→                changelog=(
+   588→                    f"Duplicated from '{source.name}' v{latest.version}."
+   589→                ),
+   590→            )
+   591→            session.add(copied_version)
+   592→            duplicate.current_version = 1
+   593→            await session.flush()
+   594→            await session.refresh(copied_version)
+   595→            await session.refresh(duplicate)
+   596→    return duplicate, copied_version
+   597→
+   598→
+   599→# --------------------------------------------------------------------------- #
+   600→# Versioning (draft -> publish -> supersede; definitions are immutable)
+   601→# --------------------------------------------------------------------------- #
+   602→
+   603→
+   604→def _check_rule_set_matches_strategy(
+   605→    strategy: Strategy, validated: RuleSet
+   606→) -> None:
+   607→    if validated.mode != strategy.mode:
+   608→        raise ValidationAppError(
+   609→            f"Rule set mode '{validated.mode}' does not match strategy mode "
+   610→            f"'{strategy.mode}'.",
+   611→            code="MODE_MISMATCH",
+   612→        )
+   613→    # A "both" strategy accepts directional rule sets; a directional
+   614→    # strategy refuses rule sets that claim the other direction (or "both").
+   615→    if (
+   616→        strategy.direction != "both"
+   617→        and validated.direction != strategy.direction
+   618→    ):
+   619→        raise ValidationAppError(
+   620→            f"Rule set direction '{validated.direction}' does not match the "
+   621→            f"strategy direction '{strategy.direction}'. Update the strategy "
+   622→            "or the rule set so they agree.",
+   623→            code="DIRECTION_MISMATCH",
+   624→        )
+   625→
+   626→
+   627→async def save_rule_set_version(
+   628→    session: AsyncSession,
+   629→    owner_id: str,
+   630→    strategy_id: uuid.UUID,
+   631→    payload: RuleSetUpload,
+   632→) -> StrategyVersion:
+   633→    """Save a new DRAFT version (previous versions are never touched)."""
+   634→
+   635→    strategy = await get_strategy(session, owner_id, strategy_id)
+   636→    try:
+   637→        validated = validate_rule_set(payload.rule_set)
+   638→    except RuleValidationError as exc:
+   639→        raise RuleValidationFailedError(
+   640→            "Rule set validation failed. See 'details' for the precise paths.",
+   641→            details=exc.errors,
+   642→        ) from exc
+   643→
+   644→    _check_rule_set_matches_strategy(strategy, validated)
+   645→
+   646→    next_version = strategy.current_version + 1
+   647→    version = StrategyVersion(
+   648→        strategy_id=strategy.id,
+   649→        version=next_version,
+   650→        status="draft",
+   651→        rule_set=validated.to_dict(),
+   652→        changelog=payload.changelog,
+   653→    )
+   654→    session.add(version)
+   655→    strategy.current_version = next_version
+   656→    try:
+   657→        await session.flush()
+   658→        await session.refresh(version)
+   659→        await session.refresh(strategy)
+   660→    except IntegrityError as exc:  # pragma: no cover - defensive
+   661→        raise ConflictError(
+   662→            f"Version {next_version} already exists for this strategy.",
+   663→            code="VERSION_CONFLICT",
+   664→        ) from exc
+   665→    return version
+   666→
+   667→
+   668→async def publish_version(
+   669→    session: AsyncSession, owner_id: str, strategy_id: uuid.UUID, version_number: int
+   670→) -> tuple[StrategyVersion, Strategy, list[str]]:
+   671→    """Publish a draft version as the strategy's definition.
+   672→
+   673→    * The published DEFINITION is immutable (stored once, never edited).
+   674→    * The previously published version (if any) becomes ``superseded`` —
+   675→      it stays available for historical analyses.
+   676→    * Publishing requires the latest validation to pass; the definition is
+   677→      revalidated defensively before the status transition.
+   678→    """
+   679→
+   680→    strategy = await get_strategy(session, owner_id, strategy_id)
+   681→    if strategy.status == "archived":
+   682→        raise ConflictError(
+   683→            "Archived strategies cannot be published. Unarchive first.",
+   684→            code="STRATEGY_ARCHIVED",
+   685→        )
+   686→    version = await get_version(session, owner_id, strategy_id, version_number)
+   687→    if version.status == "published":
+   688→        raise ConflictError(
+   689→            f"Version {version_number} is already the published version.",
+   690→            code="ALREADY_PUBLISHED",
+   691→        )
+   692→    if version.status == "superseded":
+   693→        raise ConflictError(
+   694→            f"Version {version_number} is a superseded historical definition "
+   695→            "and cannot be re-published. Save a new draft version instead.",
+   696→            code="VERSION_SUPERSEDED",
+   697→        )
+   698→
+   699→    # Defensive revalidation (stored definitions must stay valid).
+   700→    try:
+   701→        validated = validate_rule_set(version.rule_set)
+   702→    except RuleValidationError as exc:  # pragma: no cover - defensive
+   703→        raise RuleValidationFailedError(
+   704→            "Stored rule set failed revalidation. See 'details'.",
+   705→            details=exc.errors,
+   706→        ) from exc
+   707→    _check_rule_set_matches_strategy(strategy, validated)
+   708→
+   709→    # Supersede the current published version, if any.
+   710→    if strategy.published_version_number is not None:
+   711→        previous = await session.scalars(
+   712→            select(StrategyVersion)
+   713→            .where(
+   714→                StrategyVersion.strategy_id == strategy.id,
+   715→                StrategyVersion.version == strategy.published_version_number,
+   716→            )
+   717→            .limit(1)
+   718→        )
+   719→        prev_row = previous.first()
+   720→        if prev_row is not None and prev_row.status == "published":
+   721→            prev_row.status = "superseded"
+   722→
+   723→    version.status = "published"
+   724→    strategy.published_version_number = version_number
+   725→    strategy.status = "active"
+   726→    await session.flush()
+   727→    await session.refresh(version)
+   728→    await session.refresh(strategy)
+   729→    return version, strategy, validated.summary_lines()
+   730→
+   731→
+   732→async def list_versions(
+   733→    session: AsyncSession, owner_id: str, strategy_id: uuid.UUID
+   734→) -> list[StrategyVersion]:
+   735→    await get_strategy(session, owner_id, strategy_id)
+   736→    stmt = (
+   737→        select(StrategyVersion)
+   738→        .where(StrategyVersion.strategy_id == strategy_id)
+   739→        .order_by(StrategyVersion.version.desc())
+   740→    )
+   741→    return list((await session.scalars(stmt)).all())
+   742→
+   743→
+   744→async def get_version(
+   745→    session: AsyncSession, owner_id: str, strategy_id: uuid.UUID, version_number: int
+   746→) -> StrategyVersion:
+   747→    await get_strategy(session, owner_id, strategy_id)
+   748→    stmt = (
+   749→        select(StrategyVersion)
+   750→        .where(
+   751→            StrategyVersion.strategy_id == strategy_id,
+   752→            StrategyVersion.version == version_number,
+   753→        )
+   754→        .limit(1)
+   755→    )
+   756→    version = (await session.scalars(stmt)).first()
+   757→    if version is None:
+   758→        raise NotFoundError(
+   759→            f"Version {version_number} of strategy '{strategy_id}' was not found.",
+   760→            code="VERSION_NOT_FOUND",
+   761→        )
+   762→    return version
+   763→
+   764→
+   765→# --------------------------------------------------------------------------- #
+   766→# Validation results (audit trail)
+   767→# --------------------------------------------------------------------------- #
+   768→
+   769→
+   770→async def validate_and_record(
+   771→    session: AsyncSession,
+   772→    owner_id: str,
+   773→    strategy_id: uuid.UUID,
+   774→    rule_set_payload: dict[str, Any],
+   775→) -> dict[str, Any]:
+   776→    """Validate a rule set against the whitelisted schema, persist the
+   777→    result for the audit trail and return the response payload."""
+   778→
+   779→    strategy = await get_strategy(session, owner_id, strategy_id)
+   780→    normalized: RuleSet | None = None
+   781→    errors: list[dict[str, str]] = []
+   782→    schema_version = "unknown"
+   783→    try:
+   784→        validated = validate_rule_set(rule_set_payload)
+   785→        normalized = validated
+   786→        schema_version = validated.schema_version
+   787→    except RuleValidationError as exc:
+   788→        errors = exc.errors
+   789→        for entry in errors:
+   790→            if entry["path"] == ".schema_version":
+   791→                raw = rule_set_payload.get("schema_version")
+   792→                schema_version = str(raw) if raw is not None else "unknown"
+   793→
+   794→    valid = not errors
+   795→    condition_count = 0
+   796→    if normalized is not None:
+   797→        if (
+   798→            strategy.mode != normalized.mode
+   799→            or (
+   800→                strategy.direction != "both"
+   801→                and normalized.direction != strategy.direction
+   802→            )
+   803→        ):
+   804→            errors = list(errors)
+   805→            errors.append(
+   806→                {
+   807→                    "path": "$",
+   808→                    "message": (
+   809→                        f"Rule set (mode={normalized.mode}, "
+   810→                        f"direction={normalized.direction}) does not match "
+   811→                        f"the strategy (mode={strategy.mode}, "
+   812→                        f"direction={strategy.direction})."
+   813→                    ),
+   814→                    "code": "strategy_mismatch",
+   815→                }
+   816→            )
+   817→            valid = False
+   818→
+   819→        def count(g: Any) -> int:
+   820→            n = len(g.conditions)
+   821→            for nested in g.groups:
+   822→                n += count(nested)
+   823→            return n
+   824→
+   825→        condition_count = count(normalized.conditions)
+   826→        if normalized.confirmation is not None:
+   827→            condition_count += count(normalized.confirmation)
+   828→        if normalized.invalidation is not None:
+   829→            condition_count += count(normalized.invalidation)
+   830→
+   831→    result = StrategyValidationResult(
+   832→        strategy_id=strategy.id,
+   833→        owner_id=owner_id,
+   834→        schema_version=schema_version[:8],
+   835→        valid=valid,
+   836→        errors=errors,
+   837→        condition_count=condition_count,
+   838→    )
+   839→    session.add(result)
+   840→    await session.flush()
+   841→    await session.refresh(result)
+   842→
+   843→    return {
+   844→        "valid": valid,
+   845→        "errors": errors,
+   846→        "normalized": normalized.to_dict() if normalized is not None else None,
+   847→        "summary": normalized.summary_lines() if normalized is not None else [],
+   848→        "validation_id": result.id,
+   849→    }
+   850→
+   851→
+   852→_ = (STRATEGY_STATUSES, VERSION_STATUSES)  # referenced by DB CHECK constraints
+   853→

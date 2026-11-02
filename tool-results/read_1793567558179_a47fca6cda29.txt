@@ -1,0 +1,1676 @@
+     1→'use client'
+     2→
+     3→/**
+     4→ * Strategy Builder (Phase 3) — professional editor for user-defined
+     5→ * strategies.
+     6→ *
+     7→ * Design rules:
+     8→ * - Everything is persisted through the backend; nothing shown as "saved"
+     9→ *   is only local state. Unsaved edits are guarded (beforeunload + in-app
+    10→ *   confirmation) and never lost silently.
+    11→ * - Rule types come from GET /api/v1/rule-types. Planned (non-operational)
+    12→ *   types are visible but disabled and clearly badged — the UI never
+    13→ *   pretends an unsupported rule works.
+    14→ * - Parameter forms are rendered from the registry's params_schema, so new
+    15→ *   rule types appear in the editor without frontend changes.
+    16→ * - Validation errors from the backend are rendered next to the offending
+    17→ *   field via their precise paths.
+    18→ * - Publishing shows a preview of the COMPLETE definition first and stores
+    19→ *   an immutable version; previous published versions become superseded.
+    20→ */
+    21→
+    22→import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+    23→import {
+    24→  ArrowLeft,
+    25→  Archive,
+    26→  Braces,
+    27→  ChevronDown,
+    28→  ChevronUp,
+    29→  Copy,
+    30→  FileWarning,
+    31→  Layers,
+    32→  Loader2,
+    33→  Plus,
+    34→  Save,
+    35→  ShieldCheck,
+    36→  ShieldX,
+    37→  Trash2,
+    38→  X,
+    39→} from 'lucide-react'
+    40→import { toast } from '@/hooks/use-toast'
+    41→import { Badge } from '@/components/ui/badge'
+    42→import { Button } from '@/components/ui/button'
+    43→import {
+    44→  AlertDialog,
+    45→  AlertDialogAction,
+    46→  AlertDialogCancel,
+    47→  AlertDialogContent,
+    48→  AlertDialogDescription,
+    49→  AlertDialogFooter,
+    50→  AlertDialogHeader,
+    51→  AlertDialogTitle,
+    52→} from '@/components/ui/alert-dialog'
+    53→import {
+    54→  Card,
+    55→  CardContent,
+    56→  CardDescription,
+    57→  CardHeader,
+    58→  CardTitle,
+    59→} from '@/components/ui/card'
+    60→import { Checkbox } from '@/components/ui/checkbox'
+    61→import { Input } from '@/components/ui/input'
+    62→import { Label } from '@/components/ui/label'
+    63→import {
+    64→  Select,
+    65→  SelectContent,
+    66→  SelectItem,
+    67→  SelectSeparator,
+    68→  SelectTrigger,
+    69→  SelectValue,
+    70→} from '@/components/ui/select'
+    71→import { Switch } from '@/components/ui/switch'
+    72→import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+    73→import { Textarea } from '@/components/ui/textarea'
+    74→import {
+    75→  Tooltip,
+    76→  TooltipContent,
+    77→  TooltipProvider,
+    78→  TooltipTrigger,
+    79→} from '@/components/ui/tooltip'
+    80→import { api } from '@/lib/api/client'
+    81→import { MODE_LABELS, timeframesForMode } from '@/lib/platform/modes'
+    82→import {
+    83→  ApiError,
+    84→  type Category,
+    85→  type MarketRegime,
+    86→  type PlatformMode,
+    87→  type RuleCondition,
+    88→  type RuleGroup,
+    89→  type RuleSet,
+    90→  type RuleSetValidation,
+    91→  type RuleTypeSpec,
+    92→  type StrategyDetail,
+    93→  type StrategyDirection,
+    94→  type StrategyVersion,
+    95→} from '@/lib/api/types'
+    96→
+    97→const MARKET_REGIMES: MarketRegime[] = ['any', 'trending', 'ranging', 'volatile', 'quiet']
+    98→
+    99→function errorText(e: unknown): string {
+   100→  if (e instanceof ApiError) {
+   101→    const detail = e.details.length
+   102→      ? ` (${e.details.map((d) => `${d.path || ''} ${d.message ?? ''}`).join('; ')})`
+   103→      : ''
+   104→    return `${e.message}${detail}${e.requestId ? ` [${e.requestId}]` : ''}`
+   105→  }
+   106→  return e instanceof Error ? e.message : 'Unexpected error'
+   107→}
+   108→
+   109→let conditionCounter = 0
+   110→function nextConditionId(): string {
+   111→  conditionCounter += 1
+   112→  return `rule_${conditionCounter}`
+   113→}
+   114→
+   115→function emptyGroup(logic: 'AND' | 'OR' = 'AND'): RuleGroup {
+   116→  return { logic, conditions: [], groups: [] }
+   117→}
+   118→
+   119→function defaultRuleSet(mode: PlatformMode, direction: StrategyDirection): RuleSet {
+   120→  return {
+   121→    schema_version: '2.0',
+   122→    mode,
+   123→    timeframes: mode === 'binary_options' ? ['M1'] : ['H1'],
+   124→    direction,
+   125→    conditions: emptyGroup('AND'),
+   126→    confirmation: null,
+   127→    invalidation: null,
+   128→    symbols: [],
+   129→    market_regime: 'any',
+   130→    evaluation: { on_close_only: true },
+   131→  }
+   132→}
+   133→
+   134→/** Errors whose path belongs to a subtree (used for inline placement). */
+   135→function errorsForPrefix(errors: RuleSetValidation['errors'], prefix: string) {
+   136→  return errors.filter((e) => e.path === prefix || e.path.startsWith(`${prefix}.`))
+   137→}
+   138→
+   139→interface StrategyBuilderProps {
+   140→  strategyId: string
+   141→  mode: PlatformMode
+   142→  categories: Category[]
+   143→  onCategoriesChanged: () => Promise<void> | void
+   144→  onClose: () => void
+   145→  onSaved: () => Promise<void> | void
+   146→}
+   147→
+   148→export function StrategyBuilder({
+   149→  strategyId,
+   150→  mode,
+   151→  categories,
+   152→  onCategoriesChanged,
+   153→  onClose,
+   154→  onSaved,
+   155→}: StrategyBuilderProps) {
+   156→  const [loading, setLoading] = useState(true)
+   157→  const [strategy, setStrategy] = useState<StrategyDetail | null>(null)
+   158→  const [versions, setVersions] = useState<StrategyVersion[]>([])
+   159→  const [ruleTypes, setRuleTypes] = useState<RuleTypeSpec[]>([])
+   160→
+   161→  // Editable state -----------------------------------------------------------
+   162→  const [name, setName] = useState('')
+   163→  const [description, setDescription] = useState('')
+   164→  const [direction, setDirection] = useState<StrategyDirection>('bullish')
+   165→  const [ruleSet, setRuleSet] = useState<RuleSet | null>(null)
+   166→  const [changelog, setChangelog] = useState('')
+   167→  const [errors, setErrors] = useState<RuleSetValidation['errors']>([])
+   168→
+   169→  // Workflow state -----------------------------------------------------------
+   170→  const [busy, setBusy] = useState<string | null>(null)
+   171→  const [jsonMode, setJsonMode] = useState<'visual' | 'json'>('visual')
+   172→  const [jsonText, setJsonText] = useState('')
+   173→  const [previewOpen, setPreviewOpen] = useState(false)
+   174→  const [leaveConfirmOpen, setLeaveConfirmOpen] = useState(false)
+   175→  const baselineRef = useRef<string>('')
+   176→
+   177→  const dirty = useMemo(() => {
+   178→    if (!ruleSet) return false
+   179→    return (
+   180→      JSON.stringify({
+   181→        name,
+   182→        description,
+   183→        direction,
+   184→        categoryId: strategy?.category_id ?? null,
+   185→        ruleSet,
+   186→      }) !== baselineRef.current
+   187→    )
+   188→  }, [name, description, direction, ruleSet, strategy?.category_id])
+   189→
+   190→  // ---- unsaved-changes guard ------------------------------------------------
+   191→  useEffect(() => {
+   192→    if (!dirty) return
+   193→    const handler = (e: BeforeUnloadEvent) => {
+   194→      e.preventDefault()
+   195→      e.returnValue = ''
+   196→    }
+   197→    window.addEventListener('beforeunload', handler)
+   198→    return () => window.removeEventListener('beforeunload', handler)
+   199→  }, [dirty])
+   200→
+   201→  const requestClose = useCallback(() => {
+   202→    if (dirty) setLeaveConfirmOpen(true)
+   203→    else onClose()
+   204→  }, [dirty, onClose])
+   205→
+   206→  // ---- data loading ----------------------------------------------------------
+   207→  useEffect(() => {
+   208→    let cancelled = false
+   209→    ;(async () => {
+   210→      setLoading(true)
+   211→      try {
+   212→        const [detail, vers, types] = await Promise.all([
+   213→          api.get<StrategyDetail>(`/api/v1/strategies/${strategyId}`),
+   214→          api.get<StrategyVersion[]>(`/api/v1/strategies/${strategyId}/versions`),
+   215→          api.get<{ rule_types: RuleTypeSpec[] }>('/api/v1/rule-types'),
+   216→        ])
+   217→        if (cancelled) return
+   218→        setStrategy(detail)
+   219→        setVersions(vers)
+   220→        setRuleTypes(types.rule_types)
+   221→        setName(detail.name)
+   222→        setDescription(detail.description ?? '')
+   223→        setDirection(detail.direction)
+   224→        const rs: RuleSet = detail.rule_set
+   225→          ? {
+   226→              ...defaultRuleSet(detail.mode, detail.direction),
+   227→              ...detail.rule_set,
+   228→            }
+   229→          : defaultRuleSet(detail.mode, detail.direction)
+   230→        setRuleSet(rs)
+   231→        setJsonText(JSON.stringify(rs, null, 2))
+   232→        baselineRef.current = JSON.stringify({
+   233→          name: detail.name,
+   234→          description: detail.description ?? '',
+   235→          direction: detail.direction,
+   236→          categoryId: detail.category_id,
+   237→          ruleSet: rs,
+   238→        })
+   239→      } catch (e) {
+   240→        toast({ title: 'Could not load strategy', description: errorText(e), variant: 'destructive' })
+   241→        onClose()
+   242→      } finally {
+   243→        if (!cancelled) setLoading(false)
+   244→      }
+   245→    })()
+   246→    return () => {
+   247→      cancelled = true
+   248→    }
+   249→     
+   250→  }, [strategyId])
+   251→
+   252→  const typeBySlug = useMemo(() => {
+   253→    const map = new Map<string, RuleTypeSpec>()
+   254→    for (const t of ruleTypes) map.set(t.type, t)
+   255→    return map
+   256→  }, [ruleTypes])
+   257→
+   258→  const availableTypes = useMemo(
+   259→    () => ruleTypes.filter((t) => t.available),
+   260→    [ruleTypes],
+   261→  )
+   262→  const plannedTypes = useMemo(
+   263→    () => ruleTypes.filter((t) => !t.available),
+   264→    [ruleTypes],
+   265→  )
+   266→
+   267→  // ---- mutations --------------------------------------------------------------
+   268→
+   269→  function updateRuleSet(updater: (rs: RuleSet) => RuleSet) {
+   270→    setRuleSet((prev) => {
+   271→      if (!prev) return prev
+   272→      const next = updater(structuredClone(prev))
+   273→      setJsonText(JSON.stringify(next, null, 2))
+   274→      return next
+   275→    })
+   276→  }
+   277→
+   278→  function setGroupAt(
+   279→    root: RuleSet,
+   280→    path: string,
+   281→    updater: (g: RuleGroup) => RuleGroup,
+   282→  ): RuleSet {
+   283→    // path examples: ".conditions", ".confirmation", ".invalidation",
+   284→    // ".conditions.groups[0]"
+   285→    const clone = structuredClone(root)
+   286→    const segments: (string | number)[] = []
+   287→    const regex = /\.([a-zA-Z_]+)(?:\[(\d+)\])?/g
+   288→    let m: RegExpExecArray | null
+   289→    while ((m = regex.exec(path)) !== null) {
+   290→      segments.push(m[1])
+   291→      if (m[2] !== undefined) segments.push(Number(m[2]))
+   292→    }
+   293→     
+   294→    let node: any = clone
+   295→    for (let i = 0; i < segments.length - 1; i++) node = node[segments[i]]
+   296→    const last = segments[segments.length - 1]
+   297→    node[last] = updater(node[last] as RuleGroup)
+   298→    return clone
+   299→  }
+   300→
+   301→  const groupedErrors = useCallback(
+   302→    (prefix: string) => errorsForPrefix(errors, prefix),
+   303→    [errors],
+   304→  )
+   305→
+   306→  async function handleValidate() {
+   307→    if (!ruleSet) return
+   308→    let payload: unknown = ruleSet
+   309→    if (jsonMode === 'json') {
+   310→      try {
+   311→        payload = JSON.parse(jsonText)
+   312→      } catch (e) {
+   313→        toast({
+   314→          title: 'JSON syntax error',
+   315→          description: (e as Error).message,
+   316→          variant: 'destructive',
+   317→        })
+   318→        return
+   319→      }
+   320→    }
+   321→    setBusy('validate')
+   322→    try {
+   323→      const res = await api.post<RuleSetValidation>('/api/v1/rule-sets/validate', {
+   324→        rule_set: payload,
+   325→      })
+   326→      if (res.valid) {
+   327→        setErrors([])
+   328→        toast({ title: 'Rule set is valid', description: `Schema ${res.normalized?.schema_version ?? '?'}` })
+   329→        if (jsonMode === 'json' && res.normalized) {
+   330→          setRuleSet(res.normalized)
+   331→          setJsonText(JSON.stringify(res.normalized, null, 2))
+   332→        }
+   333→      } else {
+   334→        setErrors(res.errors)
+   335→        toast({
+   336→          title: `Invalid: ${res.errors.length} error(s)`,
+   337→          description: res.errors.slice(0, 3).map((er) => `${er.path}: ${er.message}`).join('\n'),
+   338→          variant: 'destructive',
+   339→        })
+   340→      }
+   341→    } catch (e) {
+   342→      toast({ title: 'Validation failed', description: errorText(e), variant: 'destructive' })
+   343→    } finally {
+   344→      setBusy(null)
+   345→    }
+   346→  }
+   347→
+   348→  async function saveDraft(): Promise<number | null> {
+   349→    if (!strategy || !ruleSet) return null
+   350→    let payload: RuleSet = ruleSet
+   351→    if (jsonMode === 'json') {
+   352→      try {
+   353→        payload = JSON.parse(jsonText)
+   354→      } catch (e) {
+   355→        toast({
+   356→          title: 'JSON syntax error',
+   357→          description: (e as Error).message,
+   358→          variant: 'destructive',
+   359→        })
+   360→        return null
+   361→      }
+   362→    }
+   363→    setBusy('save')
+   364→    try {
+   365→      // Metadata first (name/description/direction/category may have changed).
+   366→      const patchRes = await api.patch<StrategyDetail>(`/api/v1/strategies/${strategy.id}`, {
+   367→        name: name.trim() || strategy.name,
+   368→        description: description.trim() || null,
+   369→        direction,
+   370→        category_id: strategy.category_id ?? null,
+   371→      })
+   372→      const version = await api.post<StrategyVersion>(
+   373→        `/api/v1/strategies/${strategy.id}/versions`,
+   374→        { rule_set: payload, changelog: changelog.trim() || null },
+   375→      )
+   376→      setStrategy({ ...patchRes, rule_set: version.rule_set })
+   377→      setErrors([])
+   378→      setChangelog('')
+   379→      const vers = await api.get<StrategyVersion[]>(`/api/v1/strategies/${strategy.id}/versions`)
+   380→      setVersions(vers)
+   381→      baselineRef.current = JSON.stringify({
+   382→        name,
+   383→        description,
+   384→        direction,
+   385→        categoryId: patchRes.category_id,
+   386→        ruleSet: payload,
+   387→      })
+   388→      toast({
+   389→        title: `Draft v${version.version} saved`,
+   390→        description: 'Previous versions remain untouched.',
+   391→      })
+   392→      await onSaved()
+   393→      return version.version
+   394→    } catch (e) {
+   395→      const err = e as ApiError
+   396→      if (err.details?.length) setErrors(err.details as RuleSetValidation['errors'])
+   397→      toast({ title: 'Could not save draft', description: errorText(e), variant: 'destructive' })
+   398→      return null
+   399→    } finally {
+   400→      setBusy(null)
+   401→    }
+   402→  }
+   403→
+   404→  async function handlePublish() {
+   405→    if (!strategy) return
+   406→    setPreviewOpen(true)
+   407→  }
+   408→
+   409→  async function confirmPublish() {
+   410→    if (!strategy || !ruleSet) return
+   411→    setPreviewOpen(false)
+   412→    setBusy('publish')
+   413→    try {
+   414→      // Publishing persists the current definition as a draft version first.
+   415→      const savedVersion = dirty || strategy.current_version === 0 ? await saveDraft() : strategy.current_version
+   416→      if (savedVersion === null) return
+   417→      const res = await api.post<{ version: StrategyVersion; strategy: StrategyDetail; summary: string[] }>(
+   418→        `/api/v1/strategies/${strategy.id}/versions/${savedVersion}/publish`,
+   419→      )
+   420→      setStrategy({ ...res.strategy, rule_set: res.version.rule_set, summary: res.summary })
+   421→      const vers = await api.get<StrategyVersion[]>(`/api/v1/strategies/${strategy.id}/versions`)
+   422→      setVersions(vers)
+   423→      toast({
+   424→        title: `Version ${savedVersion} published`,
+   425→        description: 'The definition is now immutable and safe to evaluate later.',
+   426→      })
+   427→      await onSaved()
+   428→    } catch (e) {
+   429→      toast({ title: 'Publish failed', description: errorText(e), variant: 'destructive' })
+   430→    } finally {
+   431→      setBusy(null)
+   432→    }
+   433→  }
+   434→
+   435→  async function handleArchive() {
+   436→    if (!strategy) return
+   437→    setBusy('archive')
+   438→    try {
+   439→      await api.post(`/api/v1/strategies/${strategy.id}/archive`)
+   440→      toast({ title: 'Strategy archived', description: name })
+   441→      await onSaved()
+   442→      onClose()
+   443→    } catch (e) {
+   444→      toast({ title: 'Could not archive', description: errorText(e), variant: 'destructive' })
+   445→    } finally {
+   446→      setBusy(null)
+   447→    }
+   448→  }
+   449→
+   450→  async function handleDuplicate() {
+   451→    if (!strategy) return
+   452→    setBusy('duplicate')
+   453→    try {
+   454→      await api.post(`/api/v1/strategies/${strategy.id}/duplicate`, {})
+   455→      toast({ title: 'Duplicated', description: `Copy of ${name}` })
+   456→      await onSaved()
+   457→      onClose()
+   458→    } catch (e) {
+   459→      toast({ title: 'Could not duplicate', description: errorText(e), variant: 'destructive' })
+   460→    } finally {
+   461→      setBusy(null)
+   462→    }
+   463→  }
+   464→
+   465→  // ---- derived -----------------------------------------------------------------
+   466→
+   467→  const roots = categories.filter((c) => !c.parent_id && !c.is_archived)
+   468→  const selectedCategory = categories.find((c) => c.id === strategy?.category_id)
+   469→  const selectedRoot = selectedCategory?.parent_id
+   470→    ? categories.find((c) => c.id === selectedCategory.parent_id)
+   471→    : selectedCategory
+   472→  const subcategories = selectedRoot?.children?.filter((c) => !c.is_archived) ?? []
+   473→
+   474→  if (loading || !strategy || !ruleSet) {
+   475→    return (
+   476→      <div className="flex items-center gap-2 py-16 text-sm text-muted-foreground" role="status">
+   477→        <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> Loading strategy builder…
+   478→      </div>
+   479→    )
+   480→  }
+   481→
+   482→  return (
+   483→    <div className="space-y-4">
+   484→      {/* Header ---------------------------------------------------------- */}
+   485→      <div className="flex flex-wrap items-center justify-between gap-2">
+   486→        <div className="flex min-w-0 items-center gap-2">
+   487→          <Button variant="outline" size="sm" onClick={requestClose} aria-label="Back to strategy library">
+   488→            <ArrowLeft className="h-4 w-4" aria-hidden /> Library
+   489→          </Button>
+   490→          <h2 className="truncate text-lg font-semibold">Strategy Builder</h2>
+   491→          <Badge variant="secondary" className="font-mono">
+   492→            v{strategy.current_version || 0}
+   493→          </Badge>
+   494→          <StatusBadges strategy={strategy} />
+   495→        </div>
+   496→        <div className="flex items-center gap-2">
+   497→          <Tabs value={jsonMode} onValueChange={(v) => setJsonMode(v as 'visual' | 'json')}>
+   498→            <TabsList className="h-8">
+   499→              <TabsTrigger value="visual" className="gap-1 px-2 text-xs">
+   500→                <Layers className="h-3.5 w-3.5" aria-hidden /> Visual
+   501→              </TabsTrigger>
+   502→              <TabsTrigger value="json" className="gap-1 px-2 text-xs">
+   503→                <Braces className="h-3.5 w-3.5" aria-hidden /> JSON
+   504→              </TabsTrigger>
+   505→            </TabsList>
+   506→          </Tabs>
+   507→        </div>
+   508→      </div>
+   509→
+   510→      {dirty && (
+   511→        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+   512→          You have unsaved changes. Save a draft version to keep them.
+   513→        </div>
+   514→      )}
+   515→
+   516→      {/* Identity ---------------------------------------------------------- */}
+   517→      <Card>
+   518→        <CardHeader className="pb-3">
+   519→          <CardTitle className="text-base">Strategy</CardTitle>
+   520→          <CardDescription>
+   521→            {MODE_LABELS[mode]} mode · direction, organisation and documentation
+   522→          </CardDescription>
+   523→        </CardHeader>
+   524→        <CardContent className="grid gap-4 md:grid-cols-2">
+   525→          <div className="space-y-1.5">
+   526→            <Label htmlFor="sb-name">Name</Label>
+   527→            <Input
+   528→              id="sb-name"
+   529→              value={name}
+   530→              onChange={(e) => setName(e.target.value)}
+   531→              placeholder="e.g. M1 pullback continuation"
+   532→            />
+   533→          </div>
+   534→          <div className="space-y-1.5">
+   535→            <Label htmlFor="sb-direction">Direction</Label>
+   536→            <Select
+   537→              value={direction}
+   538→              onValueChange={(v) => setDirection(v as StrategyDirection)}
+   539→            >
+   540→              <SelectTrigger id="sb-direction" aria-label="Direction">
+   541→                <SelectValue />
+   542→              </SelectTrigger>
+   543→              <SelectContent>
+   544→                <SelectItem value="bullish">Bullish</SelectItem>
+   545→                <SelectItem value="bearish">Bearish</SelectItem>
+   546→                <SelectItem value="both">Both directions</SelectItem>
+   547→              </SelectContent>
+   548→            </Select>
+   549→          </div>
+   550→          <div className="space-y-1.5">
+   551→            <Label>Category</Label>
+   552→            <CategorySelect
+   553→              categories={roots}
+   554→              value={strategy.category_id}
+   555→              mode={mode}
+   556→              onChanged={async () => {
+   557→                await onCategoriesChanged()
+   558→              }}
+   559→              onSelected={(categoryId) => {
+   560→                setStrategy((prev) => (prev ? { ...prev, category_id: categoryId } : prev))
+   561→              }}
+   562→            />
+   563→          </div>
+   564→          <div className="space-y-1.5">
+   565→            <Label>Subcategory</Label>
+   566→            <SubcategorySelect
+   567→              parent={selectedRoot ?? null}
+   568→              subcategories={subcategories}
+   569→              value={strategy.category_id}
+   570→              disabled={!selectedRoot}
+   571→              onChanged={onCategoriesChanged}
+   572→              onSelected={(categoryId) => {
+   573→                setStrategy((prev) => (prev ? { ...prev, category_id: categoryId } : prev))
+   574→              }}
+   575→            />
+   576→          </div>
+   577→          <div className="space-y-1.5 md:col-span-2">
+   578→            <Label htmlFor="sb-desc">Description / intent</Label>
+   579→            <Textarea
+   580→              id="sb-desc"
+   581→              rows={2}
+   582→              value={description}
+   583→              onChange={(e) => setDescription(e.target.value)}
+   584→              placeholder="What is the idea behind this setup? When should it be used?"
+   585→            />
+   586→          </div>
+   587→        </CardContent>
+   588→      </Card>
+   589→
+   590→      {/* Scope ------------------------------------------------------------- */}
+   591→      <Card>
+   592→        <CardHeader className="pb-3">
+   593→          <CardTitle className="text-base">Scope &amp; evaluation</CardTitle>
+   594→          <CardDescription>
+   595→            Where and how this strategy applies. Binary Options defaults to M1 —
+   596→            higher timeframes are only used when you explicitly enable them.
+   597→          </CardDescription>
+   598→        </CardHeader>
+   599→        <CardContent className="grid gap-4 md:grid-cols-2">
+   600→          <div className="space-y-1.5">
+   601→            <Label>Timeframes (required data)</Label>
+   602→            <div className="flex flex-wrap gap-2" role="group" aria-label="Timeframes">
+   603→              {timeframesForMode(mode).map((tf) => {
+   604→                const checked = ruleSet.timeframes.includes(tf)
+   605→                return (
+   606→                  <label
+   607→                    key={tf}
+   608→                    className={`flex cursor-pointer items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium transition-colors ${
+   609→                      checked
+   610→                        ? 'border-primary bg-primary/10 text-primary'
+   611→                        : 'bg-muted/40 text-muted-foreground hover:bg-muted'
+   612→                    }`}
+   613→                  >
+   614→                    <Checkbox
+   615→                      checked={checked}
+   616→                      onCheckedChange={() => {
+   617→                        updateRuleSet((rs) => ({
+   618→                          ...rs,
+   619→                          timeframes: checked
+   620→                            ? rs.timeframes.filter((t) => t !== tf)
+   621→                            : [...rs.timeframes, tf],
+   622→                        }))
+   623→                      }}
+   624→                      aria-label={`Timeframe ${tf}`}
+   625→                    />
+   626→                    {tf}
+   627→                    {mode === 'binary_options' && tf === 'M1' && (
+   628→                      <span className="text-[10px] uppercase text-muted-foreground">default</span>
+   629→                    )}
+   630→                  </label>
+   631→                )
+   632→              })}
+   633→            </div>
+   634→            {groupedErrors('.timeframes').map((e, i) => (
+   635→              <p key={i} className="text-xs text-destructive">{e.message}</p>
+   636→            ))}
+   637→          </div>
+   638→          <SymbolsInput
+   639→            symbols={ruleSet.symbols ?? []}
+   640→            onChange={(symbols) => updateRuleSet((rs) => ({ ...rs, symbols }))}
+   641→            errors={groupedErrors('.symbols')}
+   642→          />
+   643→          <div className="space-y-1.5">
+   644→            <Label htmlFor="sb-regime">Market regime (optional)</Label>
+   645→            <Select
+   646→              value={ruleSet.market_regime ?? 'any'}
+   647→              onValueChange={(v) =>
+   648→                updateRuleSet((rs) => ({ ...rs, market_regime: v as MarketRegime }))
+   649→              }
+   650→            >
+   651→              <SelectTrigger id="sb-regime" aria-label="Market regime">
+   652→                <SelectValue />
+   653→              </SelectTrigger>
+   654→              <SelectContent>
+   655→                {MARKET_REGIMES.map((r) => (
+   656→                  <SelectItem key={r} value={r}>
+   657→                    {r === 'any' ? 'Any regime' : r[0].toUpperCase() + r.slice(1)}
+   658→                  </SelectItem>
+   659→                ))}
+   660→              </SelectContent>
+   661→            </Select>
+   662→          </div>
+   663→          <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
+   664→            <div className="min-w-0">
+   665→              <Label htmlFor="sb-onclose" className="text-sm">Closed candles only</Label>
+   666→              <p className="text-xs text-muted-foreground">
+   667→                Declare that this strategy should be evaluated on closed candles.
+   668→              </p>
+   669→            </div>
+   670→            <Switch
+   671→              id="sb-onclose"
+   672→              checked={ruleSet.evaluation?.on_close_only ?? false}
+   673→              onCheckedChange={(v) =>
+   674→                updateRuleSet((rs) => ({ ...rs, evaluation: { ...rs.evaluation, on_close_only: v } }))
+   675→              }
+   676→            />
+   677→          </div>
+   678→        </CardContent>
+   679→      </Card>
+   680→
+   681→      {/* Editor body -------------------------------------------------------- */}
+   682→      {jsonMode === 'visual' ? (
+   683→        <>
+   684→          <RuleSectionCard
+   685→            title="Core rules"
+   686→            description="The main condition tree. AND = every required rule must hold; OR = at least one. Optional rules never block."
+   687→            path=".conditions"
+   688→            ruleSet={ruleSet}
+   689→            setRuleSet={updateRuleSet}
+   690→            setGroupAt={setGroupAt}
+   691→            timeframes={ruleSet.timeframes}
+   692→            availableTypes={availableTypes}
+   693→            plannedTypes={plannedTypes}
+   694→            typeBySlug={typeBySlug}
+   695→            errors={errors}
+   696→          />
+   697→          <div className="grid gap-4 lg:grid-cols-2">
+   698→            <RuleSectionCard
+   699→              title="Confirmation (optional)"
+   700→              description="Extra rules that must ALSO hold for a setup to be confirmed."
+   701→              path=".confirmation"
+   702→              ruleSet={ruleSet}
+   703→              setRuleSet={updateRuleSet}
+   704→              setGroupAt={setGroupAt}
+   705→              timeframes={ruleSet.timeframes}
+   706→              availableTypes={availableTypes}
+   707→              plannedTypes={plannedTypes}
+   708→              typeBySlug={typeBySlug}
+   709→              errors={errors}
+   710→              clearable
+   711→            />
+   712→            <RuleSectionCard
+   713→              title="Invalidation (optional)"
+   714→              description="If these rules hold, the setup is invalid — regardless of the core rules."
+   715→              path=".invalidation"
+   716→              ruleSet={ruleSet}
+   717→              setRuleSet={updateRuleSet}
+   718→              setGroupAt={setGroupAt}
+   719→              timeframes={ruleSet.timeframes}
+   720→              availableTypes={availableTypes}
+   721→              plannedTypes={plannedTypes}
+   722→              typeBySlug={typeBySlug}
+   723→              errors={errors}
+   724→              clearable
+   725→            />
+   726→          </div>
+   727→          <Card>
+   728→            <CardHeader className="pb-3">
+   729→              <CardTitle className="text-base">Notes</CardTitle>
+   730→              <CardDescription>Explain the intent of this strategy for your future self.</CardDescription>
+   731→            </CardHeader>
+   732→            <CardContent>
+   733→              <Textarea
+   734→                rows={3}
+   735→                value={ruleSet.notes ?? ''}
+   736→                onChange={(e) => updateRuleSet((rs) => ({ ...rs, notes: e.target.value || null }))}
+   737→                placeholder="Why does this setup work? What are its failure modes?"
+   738→                aria-label="Strategy notes"
+   739→              />
+   740→              {groupedErrors('.notes').map((e, i) => (
+   741→                <p key={i} className="mt-1 text-xs text-destructive">{e.message}</p>
+   742→              ))}
+   743→            </CardContent>
+   744→          </Card>
+   745→        </>
+   746→      ) : (
+   747→        <Card>
+   748→          <CardHeader className="pb-3">
+   749→            <CardTitle className="text-base">Rule set JSON (advanced)</CardTitle>
+   750→            <CardDescription>
+   751→              Schema 2.0 — validated against the server whitelist. Use Validate to check before saving.
+   752→            </CardDescription>
+   753→          </CardHeader>
+   754→          <CardContent className="space-y-3">
+   755→            <Textarea
+   756→              value={jsonText}
+   757→              onChange={(e) => setJsonText(e.target.value)}
+   758→              spellCheck={false}
+   759→              className="min-h-[360px] font-mono text-xs"
+   760→              aria-label="Rule set JSON"
+   761→            />
+   762→          </CardContent>
+   763→        </Card>
+   764→      )}
+   765→
+   766→      {/* Global errors ------------------------------------------------------ */}
+   767→      {errors.length > 0 && (
+   768→        <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs" role="alert">
+   769→          <p className="mb-1 flex items-center gap-1.5 font-medium text-destructive">
+   770→            <ShieldX className="h-3.5 w-3.5" aria-hidden /> {errors.length} validation error(s)
+   771→          </p>
+   772→          <ul className="list-inside list-disc space-y-0.5 text-muted-foreground">
+   773→            {errors.slice(0, 8).map((er, i) => (
+   774→              <li key={i}>
+   775→                <code className="rounded bg-muted px-1">{er.path}</code> {er.message}
+   776→              </li>
+   777→            ))}
+   778→          </ul>
+   779→        </div>
+   780→      )}
+   781→
+   782→      {/* Actions + versions -------------------------------------------------- */}
+   783→      <Card>
+   784→        <CardContent className="flex flex-wrap items-center gap-2 pt-4">
+   785→          <Input
+   786→            value={changelog}
+   787→            onChange={(e) => setChangelog(e.target.value)}
+   788→            placeholder="Changelog for this version (optional)"
+   789→            aria-label="Changelog"
+   790→            className="min-w-48 flex-1"
+   791→          />
+   792→          <Button variant="outline" onClick={() => void handleValidate()} disabled={busy !== null}>
+   793→            {busy === 'validate' ? (
+   794→              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+   795→            ) : (
+   796→              <ShieldCheck className="h-4 w-4" aria-hidden />
+   797→            )}
+   798→            Validate
+   799→          </Button>
+   800→          <Button onClick={() => void saveDraft()} disabled={busy !== null}>
+   801→            {busy === 'save' ? (
+   802→              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+   803→            ) : (
+   804→              <Save className="h-4 w-4" aria-hidden />
+   805→            )}
+   806→            Save draft
+   807→          </Button>
+   808→          <Button
+   809→            variant="secondary"
+   810→            onClick={() => void handlePublish()}
+   811→            disabled={busy !== null || strategy.current_version === 0}
+   812→            title={
+   813→              strategy.current_version === 0
+   814→                ? 'Save a draft version first'
+   815→                : 'Publish the saved definition (immutable)'
+   816→            }
+   817→          >
+   818→            <ShieldCheck className="h-4 w-4" aria-hidden /> Publish…
+   819→          </Button>
+   820→          <Button variant="outline" onClick={() => void handleDuplicate()} disabled={busy !== null}>
+   821→            <Copy className="h-4 w-4" aria-hidden /> Duplicate
+   822→          </Button>
+   823→          <Button variant="outline" onClick={() => void handleArchive()} disabled={busy !== null}>
+   824→            <Archive className="h-4 w-4" aria-hidden /> Archive
+   825→          </Button>
+   826→        </CardContent>
+   827→      </Card>
+   828→
+   829→      <VersionHistory versions={versions} />
+   830→
+   831→      {/* Publish preview ------------------------------------------------------ */}
+   832→      <AlertDialog open={previewOpen} onOpenChange={setPreviewOpen}>
+   833→        <AlertDialogContent className="max-h-[85dvh] overflow-y-auto sm:max-w-2xl">
+   834→          <AlertDialogHeader>
+   835→            <AlertDialogTitle>Review before publishing</AlertDialogTitle>
+   836→            <AlertDialogDescription>
+   837→              Publishing stores this definition as an immutable version. Historical
+   838→              analyses will keep referencing the version they were evaluated with.
+   839→              {dirty && ' Your unsaved changes will be saved as a new draft version first.'}
+   840→            </AlertDialogDescription>
+   841→          </AlertDialogHeader>
+   842→          <pre className="max-h-72 overflow-auto rounded-md bg-muted p-3 font-mono text-xs" data-testid="publish-preview">
+   843→            {JSON.stringify(ruleSet, null, 2)}
+   844→          </pre>
+   845→          <AlertDialogFooter>
+   846→            <AlertDialogCancel>Cancel</AlertDialogCancel>
+   847→            <AlertDialogAction onClick={() => void confirmPublish()}>
+   848→              Save &amp; publish version
+   849→            </AlertDialogAction>
+   850→          </AlertDialogFooter>
+   851→        </AlertDialogContent>
+   852→      </AlertDialog>
+   853→
+   854→      {/* Unsaved-changes guard ------------------------------------------------ */}
+   855→      <AlertDialog open={leaveConfirmOpen} onOpenChange={setLeaveConfirmOpen}>
+   856→        <AlertDialogContent>
+   857→          <AlertDialogHeader>
+   858→            <AlertDialogTitle>Discard unsaved changes?</AlertDialogTitle>
+   859→            <AlertDialogDescription>
+   860→              You have edits that are not saved as a version. Leaving now will
+   861→              discard them.
+   862→            </AlertDialogDescription>
+   863→          </AlertDialogHeader>
+   864→          <AlertDialogFooter>
+   865→            <AlertDialogCancel>Keep editing</AlertDialogCancel>
+   866→            <AlertDialogAction
+   867→              onClick={() => {
+   868→                setLeaveConfirmOpen(false)
+   869→                onClose()
+   870→              }}
+   871→            >
+   872→              Discard changes
+   873→            </AlertDialogAction>
+   874→          </AlertDialogFooter>
+   875→        </AlertDialogContent>
+   876→      </AlertDialog>
+   877→    </div>
+   878→  )
+   879→}
+   880→
+   881→// --------------------------------------------------------------------------- //
+   882→// Small building blocks
+   883→// --------------------------------------------------------------------------- //
+   884→
+   885→function StatusBadges({ strategy }: { strategy: StrategyDetail }) {
+   886→  return (
+   887→    <>
+   888→      {strategy.published_version_number !== null && (
+   889→        <Badge variant="outline" className="border-emerald-600/40 text-emerald-700 dark:text-emerald-400">
+   890→          published v{strategy.published_version_number}
+   891→        </Badge>
+   892→      )}
+   893→      <Badge variant="outline" className="capitalize">
+   894→        {strategy.status}
+   895→      </Badge>
+   896→    </>
+   897→  )
+   898→}
+   899→
+   900→function SymbolsInput({
+   901→  symbols,
+   902→  onChange,
+   903→  errors,
+   904→}: {
+   905→  symbols: string[]
+   906→  onChange: (symbols: string[]) => void
+   907→  errors: RuleSetValidation['errors']
+   908→}) {
+   909→  const [draft, setDraft] = useState('')
+   910→  function add() {
+   911→    const value = draft.trim().toUpperCase()
+   912→    if (!value || symbols.includes(value)) return
+   913→    onChange([...symbols, value])
+   914→    setDraft('')
+   915→  }
+   916→  return (
+   917→    <div className="space-y-1.5">
+   918→      <Label htmlFor="sb-symbols">Symbol scope (optional)</Label>
+   919→      <div className="flex gap-2">
+   920→        <Input
+   921→          id="sb-symbols"
+   922→          value={draft}
+   923→          onChange={(e) => setDraft(e.target.value)}
+   924→          onKeyDown={(e) => {
+   925→            if (e.key === 'Enter') {
+   926→              e.preventDefault()
+   927→              add()
+   928→            }
+   929→          }}
+   930→          placeholder="e.g. EURUSD (empty = any symbol)"
+   931→        />
+   932→        <Button size="icon" variant="outline" aria-label="Add symbol" onClick={add}>
+   933→          <Plus className="h-4 w-4" aria-hidden />
+   934→        </Button>
+   935→      </div>
+   936→      {symbols.length > 0 && (
+   937→        <div className="flex flex-wrap gap-1.5">
+   938→          {symbols.map((s) => (
+   939→            <Badge key={s} variant="secondary" className="gap-1 font-mono">
+   940→              {s}
+   941→              <button
+   942→                type="button"
+   943→                aria-label={`Remove symbol ${s}`}
+   944→                onClick={() => onChange(symbols.filter((x) => x !== s))}
+   945→                className="ml-0.5 rounded-full hover:bg-muted"
+   946→              >
+   947→                <X className="h-3 w-3" aria-hidden />
+   948→              </button>
+   949→            </Badge>
+   950→          ))}
+   951→        </div>
+   952→      )}
+   953→      {errors.map((e, i) => (
+   954→        <p key={i} className="text-xs text-destructive">{e.message}</p>
+   955→      ))}
+   956→    </div>
+   957→  )
+   958→}
+   959→
+   960→function CategorySelect({
+   961→  categories,
+   962→  value,
+   963→  mode,
+   964→  onSelected,
+   965→  onChanged,
+   966→}: {
+   967→  categories: Category[]
+   968→  value: string | null
+   969→  mode: PlatformMode
+   970→  onSelected: (id: string | null) => void
+   971→  onChanged: () => Promise<void> | void
+   972→}) {
+   973→  const [createOpen, setCreateOpen] = useState(false)
+   974→  const [newName, setNewName] = useState('')
+   975→  const [busy, setBusy] = useState(false)
+   976→
+   977→  async function create() {
+   978→    if (!newName.trim()) return
+   979→    setBusy(true)
+   980→    try {
+   981→      const created = await api.post<Category>('/api/v1/strategy-categories', {
+   982→        name: newName.trim(),
+   983→        mode,
+   984→      })
+   985→      await onChanged()
+   986→      onSelected(created.id)
+   987→      setCreateOpen(false)
+   988→      setNewName('')
+   989→      toast({ title: 'Category created', description: created.name })
+   990→    } catch (e) {
+   991→      toast({ title: 'Could not create category', description: errorText(e), variant: 'destructive' })
+   992→    } finally {
+   993→      setBusy(false)
+   994→    }
+   995→  }
+   996→
+   997→  return (
+   998→    <>
+   999→      <Select
+  1000→        value={value ?? 'none'}
+  1001→        onValueChange={(v) => {
+  1002→          if (v === '__create') {
+  1003→            setCreateOpen(true)
+  1004→            return
+  1005→          }
+  1006→          onSelected(v === 'none' ? null : v)
+  1007→        }}
+  1008→      >
+  1009→        <SelectTrigger aria-label="Category">
+  1010→          <SelectValue placeholder="None" />
+  1011→        </SelectTrigger>
+  1012→        <SelectContent>
+  1013→          <SelectItem value="none">None</SelectItem>
+  1014→          {categories.map((c) => (
+  1015→            <SelectItem key={c.id} value={c.id}>
+  1016→              {c.name}
+  1017→            </SelectItem>
+  1018→          ))}
+  1019→          <SelectSeparator />
+  1020→          <SelectItem value="__create">＋ New category…</SelectItem>
+  1021→        </SelectContent>
+  1022→      </Select>
+  1023→      <CategoryCreateDialog
+  1024→        open={createOpen}
+  1025→        onOpenChange={(o) => {
+  1026→          setCreateOpen(o)
+  1027→          if (!o) setNewName('')
+  1028→        }}
+  1029→        title="New category"
+  1030→        name={newName}
+  1031→        setName={setNewName}
+  1032→        busy={busy}
+  1033→        onCreate={() => void create()}
+  1034→      />
+  1035→    </>
+  1036→  )
+  1037→}
+  1038→
+  1039→function SubcategorySelect({
+  1040→  parent,
+  1041→  subcategories,
+  1042→  value,
+  1043→  disabled,
+  1044→  onSelected,
+  1045→  onChanged,
+  1046→}: {
+  1047→  parent: Category | null
+  1048→  subcategories: Category[]
+  1049→  value: string | null
+  1050→  disabled: boolean
+  1051→  onSelected: (id: string | null) => void
+  1052→  onChanged: () => Promise<void> | void
+  1053→}) {
+  1054→  const [createOpen, setCreateOpen] = useState(false)
+  1055→  const [newName, setNewName] = useState('')
+  1056→  const [busy, setBusy] = useState(false)
+  1057→
+  1058→  async function create() {
+  1059→    if (!newName.trim() || !parent) return
+  1060→    setBusy(true)
+  1061→    try {
+  1062→      const created = await api.post<Category>('/api/v1/strategy-categories', {
+  1063→        name: newName.trim(),
+  1064→        mode: parent.mode,
+  1065→        parent_id: parent.id,
+  1066→      })
+  1067→      await onChanged()
+  1068→      onSelected(created.id)
+  1069→      setCreateOpen(false)
+  1070→      setNewName('')
+  1071→      toast({ title: 'Subcategory created', description: created.name })
+  1072→    } catch (e) {
+  1073→      toast({ title: 'Could not create subcategory', description: errorText(e), variant: 'destructive' })
+  1074→    } finally {
+  1075→      setBusy(false)
+  1076→    }
+  1077→  }
+  1078→
+  1079→  return (
+  1080→    <>
+  1081→      <Select
+  1082→        value={value === parent?.id ? 'root' : (value ?? 'none')}
+  1083→        disabled={disabled}
+  1084→        onValueChange={(v) => {
+  1085→          if (v === '__create') {
+  1086→            setCreateOpen(true)
+  1087→            return
+  1088→          }
+  1089→          onSelected(v === 'none' || v === 'root' ? (v === 'root' ? parent?.id ?? null : null) : v)
+  1090→        }}
+  1091→      >
+  1092→        <SelectTrigger aria-label="Subcategory">
+  1093→          <SelectValue placeholder={disabled ? 'Pick a category first' : 'None'} />
+  1094→        </SelectTrigger>
+  1095→        <SelectContent>
+  1096→          <SelectItem value="root">— Parent category only —</SelectItem>
+  1097→          <SelectItem value="none">None</SelectItem>
+  1098→          {subcategories.map((c) => (
+  1099→            <SelectItem key={c.id} value={c.id}>
+  1100→              {c.name}
+  1101→            </SelectItem>
+  1102→          ))}
+  1103→          {!disabled && <SelectSeparator />}
+  1104→          {!disabled && <SelectItem value="__create">＋ New subcategory…</SelectItem>}
+  1105→        </SelectContent>
+  1106→      </Select>
+  1107→      <CategoryCreateDialog
+  1108→        open={createOpen}
+  1109→        onOpenChange={(open) => {
+  1110→          setCreateOpen(open)
+  1111→          if (!open) setNewName('')
+  1112→        }}
+  1113→        title={`New subcategory of ${parent?.name ?? ''}`}
+  1114→        name={newName}
+  1115→        setName={setNewName}
+  1116→        busy={busy}
+  1117→        onCreate={() => void create()}
+  1118→      />
+  1119→    </>
+  1120→  )
+  1121→}
+  1122→
+  1123→function CategoryCreateDialog({
+  1124→  open,
+  1125→  onOpenChange,
+  1126→  title,
+  1127→  name,
+  1128→  setName,
+  1129→  busy,
+  1130→  onCreate,
+  1131→}: {
+  1132→  open: boolean
+  1133→  onOpenChange: (open: boolean) => void
+  1134→  title: string
+  1135→  name: string
+  1136→  setName: (v: string) => void
+  1137→  busy: boolean
+  1138→  onCreate: () => void
+  1139→}) {
+  1140→  return (
+  1141→    <AlertDialog open={open} onOpenChange={onOpenChange}>
+  1142→      <AlertDialogContent>
+  1143→        <AlertDialogHeader>
+  1144→          <AlertDialogTitle>{title}</AlertDialogTitle>
+  1145→          <AlertDialogDescription>
+  1146→            Categories organise your strategies per analysis mode.
+  1147→          </AlertDialogDescription>
+  1148→        </AlertDialogHeader>
+  1149→        <Input
+  1150→          autoFocus
+  1151→          value={name}
+  1152→          onChange={(e) => setName(e.target.value)}
+  1153→          placeholder="Category name"
+  1154→          aria-label="Category name"
+  1155→          onKeyDown={(e) => {
+  1156→            if (e.key === 'Enter') {
+  1157→              e.preventDefault()
+  1158→              onCreate()
+  1159→            }
+  1160→          }}
+  1161→        />
+  1162→        <AlertDialogFooter>
+  1163→          <AlertDialogCancel>Cancel</AlertDialogCancel>
+  1164→          <AlertDialogAction onClick={onCreate} disabled={busy || !name.trim()}>
+  1165→            {busy && <Loader2 className="mr-1 h-4 w-4 animate-spin" aria-hidden />} Create
+  1166→          </AlertDialogAction>
+  1167→        </AlertDialogFooter>
+  1168→      </AlertDialogContent>
+  1169→    </AlertDialog>
+  1170→  )
+  1171→}
+  1172→
+  1173→function VersionHistory({ versions }: { versions: StrategyVersion[] }) {
+  1174→  if (versions.length === 0) return null
+  1175→  const statusVariant = (s: StrategyVersion['status']) =>
+  1176→    s === 'published'
+  1177→      ? 'border-emerald-600/40 text-emerald-700 dark:text-emerald-400'
+  1178→      : s === 'superseded'
+  1179→        ? 'border-muted-foreground/30 text-muted-foreground'
+  1180→        : 'border-amber-600/40 text-amber-700 dark:text-amber-400'
+  1181→  return (
+  1182→    <Card>
+  1183→      <CardHeader className="pb-2">
+  1184→        <CardTitle className="text-base">Version history</CardTitle>
+  1185→        <CardDescription>
+  1186→          Every save creates an immutable version. Published definitions never change.
+  1187→        </CardDescription>
+  1188→      </CardHeader>
+  1189→      <CardContent>
+  1190→        <ul className="divide-y text-sm">
+  1191→          {versions.map((v) => (
+  1192→            <li key={v.id} className="flex flex-wrap items-center justify-between gap-2 py-2">
+  1193→              <span className="flex items-center gap-2 font-mono text-xs">
+  1194→                v{v.version}
+  1195→                <Badge variant="outline" className={statusVariant(v.status)}>
+  1196→                  {v.status}
+  1197→                </Badge>
+  1198→              </span>
+  1199→              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+  1200→                {v.changelog ?? '—'}
+  1201→              </span>
+  1202→              <span className="shrink-0 text-xs text-muted-foreground">
+  1203→                {new Date(v.created_at).toISOString().slice(0, 16).replace('T', ' ')} UTC
+  1204→              </span>
+  1205→            </li>
+  1206→          ))}
+  1207→        </ul>
+  1208→      </CardContent>
+  1209→    </Card>
+  1210→  )
+  1211→}
+  1212→
+  1213→// --------------------------------------------------------------------------- //
+  1214→// Rule tree editing
+  1215→// --------------------------------------------------------------------------- //
+  1216→
+  1217→interface RuleSectionProps {
+  1218→  title: string
+  1219→  description: string
+  1220→  path: string
+  1221→  ruleSet: RuleSet
+  1222→  setRuleSet: (updater: (rs: RuleSet) => RuleSet) => void
+  1223→  setGroupAt: (root: RuleSet, path: string, updater: (g: RuleGroup) => RuleGroup) => RuleSet
+  1224→  timeframes: string[]
+  1225→  availableTypes: RuleTypeSpec[]
+  1226→  plannedTypes: RuleTypeSpec[]
+  1227→  typeBySlug: Map<string, RuleTypeSpec>
+  1228→  errors: RuleSetValidation['errors']
+  1229→  clearable?: boolean
+  1230→}
+  1231→
+  1232→function RuleSectionCard(props: RuleSectionProps) {
+  1233→  const { ruleSet, setRuleSet, setGroupAt, path, clearable } = props
+  1234→   
+  1235→  const group = path
+  1236→    .replace(/^\./, '')
+  1237→    .split('.')
+  1238→     
+  1239→    .reduce<any>((node, key) => {
+  1240→      const m = key.match(/^([a-zA-Z_]+)(?:\[(\d+)\])?$/)
+  1241→      if (!m || node === undefined) return node
+  1242→      let next = node?.[m[1]]
+  1243→      if (m[2] !== undefined) next = next?.[Number(m[2])]
+  1244→      return next
+  1245→    }, ruleSet) as RuleGroup | null
+  1246→
+  1247→  return (
+  1248→    <Card>
+  1249→      <CardHeader className="pb-3">
+  1250→        <div className="flex flex-wrap items-center justify-between gap-2">
+  1251→          <div>
+  1252→            <CardTitle className="text-base">{props.title}</CardTitle>
+  1253→            <CardDescription>{props.description}</CardDescription>
+  1254→          </div>
+  1255→          {clearable && group && (
+  1256→            <Button
+  1257→              size="sm"
+  1258→              variant="ghost"
+  1259→              onClick={() => setRuleSet((rs) => setGroupAt(rs, path, () => null as unknown as RuleGroup))}
+  1260→              aria-label={`Remove ${props.title.toLowerCase()} rules`}
+  1261→            >
+  1262→              <Trash2 className="h-3.5 w-3.5" aria-hidden /> Remove
+  1263→            </Button>
+  1264→          )}
+  1265→        </div>
+  1266→      </CardHeader>
+  1267→      <CardContent>
+  1268→        {group ? (
+  1269→          <GroupEditor {...props} group={group} />
+  1270→        ) : (
+  1271→          <Button
+  1272→            size="sm"
+  1273→            variant="outline"
+  1274→            onClick={() =>
+  1275→              setRuleSet((rs) =>
+  1276→                setGroupAt(rs, path, () => emptyGroup('AND') as unknown as RuleGroup),
+  1277→              )
+  1278→            }
+  1279→          >
+  1280→            <Plus className="h-4 w-4" aria-hidden /> Add rules
+  1281→          </Button>
+  1282→        )}
+  1283→      </CardContent>
+  1284→    </Card>
+  1285→  )
+  1286→}
+  1287→
+  1288→function GroupEditor({
+  1289→  group,
+  1290→  path,
+  1291→  ruleSet,
+  1292→  setRuleSet,
+  1293→  setGroupAt,
+  1294→  timeframes,
+  1295→  availableTypes,
+  1296→  plannedTypes,
+  1297→  typeBySlug,
+  1298→  errors,
+  1299→  depth = 0,
+  1300→}: RuleSectionProps & { group: RuleGroup; depth?: number }) {
+  1301→  const prefix = path
+  1302→  const groupErrors = errorsForPrefix(errors, prefix).filter((e) => e.path === prefix)
+  1303→
+  1304→  function patchGroup(updater: (g: RuleGroup) => RuleGroup) {
+  1305→    setRuleSet((rs) => setGroupAt(rs, path, updater))
+  1306→  }
+  1307→
+  1308→  function addCondition() {
+  1309→    patchGroup((g) => ({
+  1310→      ...g,
+  1311→      conditions: [
+  1312→        ...g.conditions,
+  1313→        {
+  1314→          id: nextConditionId(),
+  1315→          type: availableTypes[0]?.type ?? 'price_level',
+  1316→          timeframe: timeframes[0] ?? 'H1',
+  1317→          lookback: availableTypes[0]?.default_lookback ?? 20,
+  1318→          params: {},
+  1319→        },
+  1320→      ],
+  1321→    }))
+  1322→  }
+  1323→
+  1324→  return (
+  1325→    <div className="space-y-3 rounded-md border p-3" data-testid={`group${path}`}>
+  1326→      {/* Logic toggle */}
+  1327→      <div className="flex flex-wrap items-center justify-between gap-2">
+  1328→        <div
+  1329→          className="flex overflow-hidden rounded-md border"
+  1330→          role="group"
+  1331→          aria-label="Group logic"
+  1332→        >
+  1333→          {(['AND', 'OR'] as const).map((logic) => (
+  1334→            <button
+  1335→              key={logic}
+  1336→              type="button"
+  1337→              aria-pressed={group.logic === logic}
+  1338→              onClick={() => patchGroup((g) => ({ ...g, logic }))}
+  1339→              className={`px-3 py-1 text-xs font-semibold transition-colors ${
+  1340→                group.logic === logic
+  1341→                  ? 'bg-primary text-primary-foreground'
+  1342→                  : 'bg-background text-muted-foreground hover:bg-muted'
+  1343→              }`}
+  1344→            >
+  1345→              {logic}
+  1346→            </button>
+  1347→          ))}
+  1348→        </div>
+  1349→        <div className="flex items-center gap-1">
+  1350→          <Button size="sm" variant="outline" onClick={addCondition}>
+  1351→            <Plus className="h-3.5 w-3.5" aria-hidden /> Rule
+  1352→          </Button>
+  1353→          {depth < 3 && (
+  1354→            <Button
+  1355→              size="sm"
+  1356→              variant="outline"
+  1357→              onClick={() => patchGroup((g) => ({ ...g, groups: [...g.groups, emptyGroup('OR')] }))}
+  1358→            >
+  1359→              <Plus className="h-3.5 w-3.5" aria-hidden /> Group
+  1360→            </Button>
+  1361→          )}
+  1362→        </div>
+  1363→      </div>
+  1364→
+  1365→      {groupErrors.map((e, i) => (
+  1366→        <p key={i} className="text-xs text-destructive">{e.message}</p>
+  1367→      ))}
+  1368→
+  1369→      {/* Conditions */}
+  1370→      <div className="space-y-2">
+  1371→        {group.conditions.map((cond, index) => {
+  1372→          const condPath = `${prefix}.conditions[${index}]`
+  1373→          return (
+  1374→            <ConditionCard
+  1375→              key={cond.id}
+  1376→              condition={cond}
+  1377→              path={condPath}
+  1378→              index={index}
+  1379→              total={group.conditions.length}
+  1380→              timeframes={timeframes}
+  1381→              availableTypes={availableTypes}
+  1382→              plannedTypes={plannedTypes}
+  1383→              typeBySlug={typeBySlug}
+  1384→              errors={errors}
+  1385→              onChange={(next) =>
+  1386→                patchGroup((g) => ({
+  1387→                  ...g,
+  1388→                  conditions: g.conditions.map((c, i) => (i === index ? next : c)),
+  1389→                }))
+  1390→              }
+  1391→              onRemove={() =>
+  1392→                patchGroup((g) => ({
+  1393→                  ...g,
+  1394→                  conditions: g.conditions.filter((_, i) => i !== index),
+  1395→                }))
+  1396→              }
+  1397→              onMove={(dir) =>
+  1398→                patchGroup((g) => {
+  1399→                  const next = [...g.conditions]
+  1400→                  const target = index + dir
+  1401→                  if (target < 0 || target >= next.length) return g
+  1402→                  ;[next[index], next[target]] = [next[target], next[index]]
+  1403→                  return { ...g, conditions: next }
+  1404→                })
+  1405→              }
+  1406→            />
+  1407→          )
+  1408→        })}
+  1409→      </div>
+  1410→
+  1411→      {/* Nested groups */}
+  1412→      <div className="space-y-2">
+  1413→        {group.groups.map((nested, i) => (
+  1414→          <GroupEditor
+  1415→            key={`${path}.groups[${i}]`}
+  1416→            {...({
+  1417→              ruleSet,
+  1418→              setRuleSet,
+  1419→              setGroupAt,
+  1420→              timeframes,
+  1421→              availableTypes,
+  1422→              plannedTypes,
+  1423→              typeBySlug,
+  1424→              errors,
+  1425→            } as RuleSectionProps)}
+  1426→            group={nested}
+  1427→            path={`${path}.groups[${i}]`}
+  1428→            depth={depth + 1}
+  1429→          />
+  1430→        ))}
+  1431→      </div>
+  1432→    </div>
+  1433→  )
+  1434→}
+  1435→
+  1436→function ConditionCard({
+  1437→  condition,
+  1438→  path,
+  1439→  index,
+  1440→  total,
+  1441→  timeframes,
+  1442→  availableTypes,
+  1443→  plannedTypes,
+  1444→  typeBySlug,
+  1445→  errors,
+  1446→  onChange,
+  1447→  onRemove,
+  1448→  onMove,
+  1449→}: {
+  1450→  condition: RuleCondition
+  1451→  path: string
+  1452→  index: number
+  1453→  total: number
+  1454→  timeframes: string[]
+  1455→  availableTypes: RuleTypeSpec[]
+  1456→  plannedTypes: RuleTypeSpec[]
+  1457→  typeBySlug: Map<string, RuleTypeSpec>
+  1458→  errors: RuleSetValidation['errors']
+  1459→  onChange: (next: RuleCondition) => void
+  1460→  onRemove: () => void
+  1461→  onMove: (dir: -1 | 1) => void
+  1462→}) {
+  1463→  const spec = typeBySlug.get(condition.type)
+  1464→  const ownErrors = errorsForPrefix(errors, path)
+  1465→  const paramErrors = (key: string) =>
+  1466→    ownErrors.filter((e) => e.path === `${path}.params.${key}`)
+  1467→  const generalErrors = ownErrors.filter((e) => !e.path.includes('.params.'))
+  1468→
+  1469→  function changeType(type: string) {
+  1470→    const nextSpec = typeBySlug.get(type)
+  1471→    onChange({
+  1472→      ...condition,
+  1473→      type,
+  1474→      lookback: nextSpec?.default_lookback ?? condition.lookback,
+  1475→      params: {},
+  1476→    })
+  1477→  }
+  1478→
+  1479→  function setParam(key: string, raw: string, schemaType: string) {
+  1480→    let value: unknown
+  1481→    if (schemaType === 'integer') value = raw === '' ? undefined : parseInt(raw, 10)
+  1482→    else if (schemaType === 'number') value = raw === '' ? undefined : parseFloat(raw)
+  1483→    else value = raw
+  1484→    const params = { ...condition.params }
+  1485→    if (value === undefined || value === null || Number.isNaN(value as number)) {
+  1486→      delete params[key]
+  1487→    } else {
+  1488→      params[key] = value
+  1489→    }
+  1490→    onChange({ ...condition, params })
+  1491→  }
+  1492→
+  1493→  return (
+  1494→    <div className="rounded-md border bg-background p-3" data-condition-id={condition.id}>
+  1495→      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+  1496→        <div className="flex flex-wrap items-center gap-2">
+  1497→          <Select value={condition.type} onValueChange={changeType}>
+  1498→            <SelectTrigger className="h-8 w-56" aria-label={`Rule type of ${condition.id}`}>
+  1499→              <SelectValue />
+  1500→            </SelectTrigger>
+  1501→            <SelectContent>
+  1502→              {availableTypes.map((t) => (
+  1503→                <SelectItem key={t.type} value={t.type}>
+  1504→                  {t.title}
+  1505→                </SelectItem>
+  1506→              ))}
+  1507→              <SelectSeparator />
+  1508→              {plannedTypes.map((t) => (
+  1509→                <SelectItem key={t.type} value={t.type} disabled>
+  1510→                  {t.title} — planned
+  1511→                </SelectItem>
+  1512→              ))}
+  1513→            </SelectContent>
+  1514→          </Select>
+  1515→          <Badge variant="outline" className="font-mono text-[10px]">
+  1516→            {condition.id}
+  1517→          </Badge>
+  1518→        </div>
+  1519→        <TooltipProvider delayDuration={200}>
+  1520→          <div className="flex items-center gap-1">
+  1521→            <Tooltip>
+  1522→              <TooltipTrigger asChild>
+  1523→                <Button
+  1524→                  size="icon"
+  1525→                  variant="ghost"
+  1526→                  className="h-7 w-7"
+  1527→                  aria-label="Move rule up"
+  1528→                  disabled={index === 0}
+  1529→                  onClick={() => onMove(-1)}
+  1530→                >
+  1531→                  <ChevronUp className="h-3.5 w-3.5" aria-hidden />
+  1532→                </Button>
+  1533→              </TooltipTrigger>
+  1534→              <TooltipContent>Rule order (earlier first)</TooltipContent>
+  1535→            </Tooltip>
+  1536→            <Tooltip>
+  1537→              <TooltipTrigger asChild>
+  1538→                <Button
+  1539→                  size="icon"
+  1540→                  variant="ghost"
+  1541→                  className="h-7 w-7"
+  1542→                  aria-label="Move rule down"
+  1543→                  disabled={index === total - 1}
+  1544→                  onClick={() => onMove(1)}
+  1545→                >
+  1546→                  <ChevronDown className="h-3.5 w-3.5" aria-hidden />
+  1547→                </Button>
+  1548→              </TooltipTrigger>
+  1549→              <TooltipContent>Rule order (later last)</TooltipContent>
+  1550→            </Tooltip>
+  1551→            <Tooltip>
+  1552→              <TooltipTrigger asChild>
+  1553→                <Button
+  1554→                  size="icon"
+  1555→                  variant="ghost"
+  1556→                  className="h-7 w-7"
+  1557→                  aria-label={`Remove rule ${condition.id}`}
+  1558→                  onClick={onRemove}
+  1559→                >
+  1560→                  <Trash2 className="h-3.5 w-3.5 text-destructive" aria-hidden />
+  1561→                </Button>
+  1562→              </TooltipTrigger>
+  1563→              <TooltipContent>Remove rule</TooltipContent>
+  1564→            </Tooltip>
+  1565→          </div>
+  1566→        </TooltipProvider>
+  1567→      </div>
+  1568→
+  1569→      <div className="grid gap-2 sm:grid-cols-[1fr_2fr]">
+  1570→        <div className="space-y-2">
+  1571→          <div className="space-y-1">
+  1572→            <Label htmlFor={`${condition.id}-tf`} className="text-xs">Timeframe</Label>
+  1573→            <Select
+  1574→              value={condition.timeframe}
+  1575→              onValueChange={(v) => onChange({ ...condition, timeframe: v })}
+  1576→            >
+  1577→              <SelectTrigger id={`${condition.id}-tf`} className="h-8" aria-label="Rule timeframe">
+  1578→                <SelectValue />
+  1579→              </SelectTrigger>
+  1580→              <SelectContent>
+  1581→                {timeframes.map((tf) => (
+  1582→                  <SelectItem key={tf} value={tf}>
+  1583→                    {tf}
+  1584→                  </SelectItem>
+  1585→                ))}
+  1586→              </SelectContent>
+  1587→            </Select>
+  1588→            {ownErrors.some((e) => e.path === `${path}.timeframe`) && (
+  1589→              <p className="text-xs text-destructive">
+  1590→                {ownErrors.find((e) => e.path === `${path}.timeframe`)?.message}
+  1591→              </p>
+  1592→            )}
+  1593→          </div>
+  1594→          <div className="space-y-1">
+  1595→            <Label htmlFor={`${condition.id}-lb`} className="text-xs">
+  1596→              Lookback{spec ? ` (${spec.default_lookback} default)` : ''}
+  1597→            </Label>
+  1598→            <Input
+  1599→              id={`${condition.id}-lb`}
+  1600→              type="number"
+  1601→              min={1}
+  1602→              max={500}
+  1603→              className="h-8"
+  1604→              value={condition.lookback}
+  1605→              onChange={(e) =>
+  1606→                onChange({ ...condition, lookback: parseInt(e.target.value, 10) || 1 })
+  1607→              }
+  1608→            />
+  1609→          </div>
+  1610→          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+  1611→            <Checkbox
+  1612→              checked={condition.optional ?? false}
+  1613→              onCheckedChange={(v) => onChange({ ...condition, optional: v === true })}
+  1614→              aria-label={`Rule ${condition.id} optional`}
+  1615→            />
+  1616→            Optional (never blocks)
+  1617→          </label>
+  1618→        </div>
+  1619→
+  1620→        <div className="space-y-2">
+  1621→          {!spec && (
+  1622→            <p className="flex items-center gap-1.5 text-xs text-destructive">
+  1623→              <FileWarning className="h-3.5 w-3.5" aria-hidden /> Unknown rule type — pick one from the list.
+  1624→            </p>
+  1625→          )}
+  1626→          {spec &&
+  1627→            Object.entries(spec.params_schema).map(([key, schema]) => (
+  1628→              <div key={key} className="space-y-1">
+  1629→                <Label htmlFor={`${condition.id}-${key}`} className="text-xs">
+  1630→                  {key}
+  1631→                  {spec.required_params.includes(key) && <span className="text-destructive"> *</span>}
+  1632→                </Label>
+  1633→                {schema.enum ? (
+  1634→                  <Select
+  1635→                    value={String(condition.params[key] ?? '')}
+  1636→                    onValueChange={(v) => setParam(key, v, 'string')}
+  1637→                  >
+  1638→                    <SelectTrigger id={`${condition.id}-${key}`} className="h-8" aria-label={key}>
+  1639→                      <SelectValue placeholder={`Select ${key.replace(/_/g, ' ')}`} />
+  1640→                    </SelectTrigger>
+  1641→                    <SelectContent>
+  1642→                      {schema.enum.map((opt) => (
+  1643→                        <SelectItem key={opt} value={opt}>
+  1644→                          {opt.replace(/_/g, ' ')}
+  1645→                        </SelectItem>
+  1646→                      ))}
+  1647→                    </SelectContent>
+  1648→                  </Select>
+  1649→                ) : (
+  1650→                  <Input
+  1651→                    id={`${condition.id}-${key}`}
+  1652→                    type="number"
+  1653→                    step="any"
+  1654→                    className="h-8"
+  1655→                    value={condition.params[key] === undefined ? '' : String(condition.params[key])}
+  1656→                    onChange={(e) => setParam(key, e.target.value, schema.type)}
+  1657→                    aria-label={key}
+  1658→                  />
+  1659→                )}
+  1660→                {schema.description && (
+  1661→                  <p className="text-[11px] leading-snug text-muted-foreground">{schema.description}</p>
+  1662→                )}
+  1663→                {paramErrors(key).map((e, i) => (
+  1664→                  <p key={i} className="text-xs text-destructive">{e.message}</p>
+  1665→                ))}
+  1666→              </div>
+  1667→            ))}
+  1668→          {generalErrors.map((e, i) => (
+  1669→            <p key={i} className="text-xs text-destructive">{e.message}</p>
+  1670→          ))}
+  1671→        </div>
+  1672→      </div>
+  1673→    </div>
+  1674→  )
+  1675→}
+  1676→

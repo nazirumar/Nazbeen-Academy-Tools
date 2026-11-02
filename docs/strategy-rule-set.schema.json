@@ -1,0 +1,739 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ta-workbench.local/schemas/strategy-rule-set-2.0.json",
+  "title": "TA Workbench strategy rule set (schema 2.0)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "mode",
+    "timeframes",
+    "direction",
+    "conditions"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "1.0",
+        "2.0"
+      ]
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "forex",
+        "binary_options"
+      ]
+    },
+    "timeframes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 6,
+      "items": {
+        "type": "string",
+        "enum": [
+          "M1",
+          "M5",
+          "M15",
+          "H1",
+          "H4",
+          "D1"
+        ]
+      },
+      "description": "Binary Options defaults to ['M1']; higher timeframes are allowed only when explicitly declared."
+    },
+    "direction": {
+      "type": "string",
+      "enum": [
+        "bullish",
+        "bearish",
+        "both"
+      ]
+    },
+    "symbols": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 32
+      }
+    },
+    "market_regime": {
+      "type": "string",
+      "enum": [
+        "any",
+        "trending",
+        "ranging",
+        "volatile",
+        "quiet",
+        "uptrend",
+        "downtrend",
+        "range",
+        "breakout",
+        "transition"
+      ]
+    },
+    "evaluation": {
+      "type": "object",
+      "properties": {
+        "on_close_only": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "conditions": {
+      "$ref": "#/definitions/group"
+    },
+    "confirmation": {
+      "oneOf": [
+        {
+          "$ref": "#/definitions/group"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "invalidation": {
+      "oneOf": [
+        {
+          "$ref": "#/definitions/group"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 2000
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "group": {
+      "type": "object",
+      "required": [
+        "logic"
+      ],
+      "properties": {
+        "logic": {
+          "type": "string",
+          "enum": [
+            "AND",
+            "OR"
+          ]
+        },
+        "conditions": {
+          "type": "array",
+          "maxItems": 25,
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "type",
+              "timeframe"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "maxLength": 64
+              },
+              "type": {
+                "type": "string",
+                "description": "Must be an AVAILABLE type in the registry (see /api/v1/rule-types). Planned types are rejected with rule_type_not_available."
+              },
+              "timeframe": {
+                "type": "string",
+                "enum": [
+                  "M1",
+                  "M5",
+                  "M15",
+                  "H1",
+                  "H4",
+                  "D1"
+                ]
+              },
+              "lookback": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500
+              },
+              "optional": {
+                "type": "boolean",
+                "default": false
+              },
+              "params": {
+                "type": "object",
+                "description": "Per-type parameters."
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/group"
+          },
+          "description": "Nested groups; max depth 4."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "ta_workbench_rule_types": [
+    {
+      "type": "price_level",
+      "title": "Price vs level",
+      "description": "Compares a candle price series (open/high/low/close) against a fixed numeric threshold supplied by the user.",
+      "semantics": "above/below: the LATEST candle in the window must satisfy the comparison. crosses_above/crosses_below: the latest candle must complete the cross relative to the previous candle. Evidence reports every cross in the window. Uses only candles supplied at evaluation time \u2014 no look-ahead.",
+      "available": true,
+      "status": "operational",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 20,
+      "data_note": "",
+      "required_params": [
+        "field",
+        "operator",
+        "value"
+      ],
+      "params_schema": {
+        "field": {
+          "type": "string",
+          "enum": [
+            "open",
+            "high",
+            "low",
+            "close"
+          ],
+          "description": "Price field of a candle."
+        },
+        "operator": {
+          "type": "string",
+          "enum": [
+            "above",
+            "below",
+            "crosses_above",
+            "crosses_below"
+          ],
+          "description": "Comparison operator."
+        },
+        "value": {
+          "type": "number",
+          "description": "Threshold to compare against."
+        }
+      }
+    },
+    {
+      "type": "candle_property",
+      "title": "Candle property vs threshold",
+      "description": "Compares a derived property of the latest closed candle (body, range, wick sizes or a raw price field) against a numeric threshold.",
+      "semantics": "The property is computed on the LATEST candle of the provided window and compared with the threshold (above/below). body = |close - open|, range = high - low, upper_wick = high - max(open, close), lower_wick = min(open, close) - low. Uses only data available at evaluation time.",
+      "available": true,
+      "status": "operational",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 1,
+      "data_note": "",
+      "required_params": [
+        "property",
+        "operator",
+        "value"
+      ],
+      "params_schema": {
+        "property": {
+          "type": "string",
+          "enum": [
+            "open",
+            "high",
+            "low",
+            "close",
+            "body",
+            "range",
+            "upper_wick",
+            "lower_wick"
+          ],
+          "description": "Candle property to measure."
+        },
+        "operator": {
+          "type": "string",
+          "enum": [
+            "above",
+            "below"
+          ],
+          "description": "Comparison operator."
+        },
+        "value": {
+          "type": "number",
+          "description": "Threshold to compare against.",
+          "minimum": 0
+        }
+      }
+    },
+    {
+      "type": "candle_pattern",
+      "title": "Candlestick pattern",
+      "description": "Detects a classic candlestick pattern on the latest closed candle(s) of the window.",
+      "semantics": "bullish/bearish_engulfing: the latest candle's body fully engulfs the previous candle's body (opposite colours). hammer: small body near the top, lower wick >= 2x body, closing in the upper half. shooting_star: mirror of the hammer (upper wick >= 2x body, close in the lower half). doji: |close - open| <= max_body_ratio * range. inside_bar: latest high/low fully inside the previous candle's range. Patterns need 1-2 candles; otherwise the rule is unsatisfied with an explicit evidence reason.",
+      "available": true,
+      "status": "operational",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 2,
+      "data_note": "Engulfing and inside_bar need at least 2 candles.",
+      "required_params": [
+        "pattern"
+      ],
+      "params_schema": {
+        "pattern": {
+          "type": "string",
+          "enum": [
+            "bullish_engulfing",
+            "bearish_engulfing",
+            "hammer",
+            "shooting_star",
+            "doji",
+            "inside_bar"
+          ],
+          "description": "Pattern to detect."
+        },
+        "max_body_ratio": {
+          "type": "number",
+          "description": "Doji only: maximum body size as a fraction of the candle range.",
+          "minimum": 0.0,
+          "maximum": 0.5
+        }
+      }
+    },
+    {
+      "type": "swing_point",
+      "title": "Swing high / swing low",
+      "description": "Checks whether a confirmed swing high or swing low of the given strength exists inside the lookback window.",
+      "semantics": "A candle is a swing high when its high is strictly greater than the highs of ``strength`` candles on BOTH sides inside the supplied window; a swing low is the mirror image. A swing is CONFIRMED only once ``strength`` subsequent candles exist, so confirmation always uses data available at evaluation time (no look-ahead: the swing near the right edge that still needs future bars is reported as 'pending' and never counts).",
+      "available": true,
+      "status": "operational",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 20,
+      "data_note": "Detecting swings of strength N near the end of the window needs N subsequent candles \u2014 request enough history.",
+      "required_params": [
+        "kind",
+        "strength"
+      ],
+      "params_schema": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "high",
+            "low"
+          ],
+          "description": "Swing direction to detect."
+        },
+        "strength": {
+          "type": "integer",
+          "description": "Bars on each side required to confirm the swing.",
+          "minimum": 1,
+          "maximum": 10
+        }
+      }
+    },
+    {
+      "type": "structure_pattern",
+      "title": "Market structure (HH / HL / LH / LL)",
+      "description": "Checks the sequence of the last confirmed swing highs or swing lows: strictly rising (higher highs / higher lows) or strictly falling (lower highs / lower lows).",
+      "semantics": "Confirms swing points with the given strength inside the window, takes the most recent ``count`` swings of the kind implied by the pattern (highs for higher_highs/lower_highs, lows for higher_lows/lower_lows) and requires each to be strictly greater (rising) / smaller (falling) than its predecessor. Fewer than ``count`` confirmed swings => unsatisfied with evidence. No look-ahead: only swings already confirmed by subsequent candles count.",
+      "available": true,
+      "status": "operational",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 60,
+      "data_note": "",
+      "required_params": [
+        "pattern"
+      ],
+      "params_schema": {
+        "pattern": {
+          "type": "string",
+          "enum": [
+            "higher_highs",
+            "higher_lows",
+            "lower_highs",
+            "lower_lows"
+          ],
+          "description": "Structure sequence to require."
+        },
+        "count": {
+          "type": "integer",
+          "description": "Swings that must form the sequence.",
+          "minimum": 2,
+          "maximum": 5
+        },
+        "strength": {
+          "type": "integer",
+          "description": "Swing confirmation strength.",
+          "minimum": 1,
+          "maximum": 10
+        }
+      }
+    },
+    {
+      "type": "market_structure_break",
+      "title": "Market structure break (generic BOS)",
+      "description": "The latest candle's close breaks beyond the most recent confirmed swing high (bullish) or swing low (bearish) inside the window.",
+      "semantics": "bullish: close of the latest candle > the most recent confirmed swing high in the window (and that swing must not BE the latest candle). bearish: close < the most recent confirmed swing low. The break is evaluated on the latest candle only \u2014 the rule is a snapshot, not a memory of past breaks. No look-ahead: swing levels come from candles at or before the break candle.",
+      "available": true,
+      "status": "operational",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 40,
+      "data_note": "This is the generic, precisely-defined building block. MSS/CHOCH-specific semantics remain a planned rule type.",
+      "required_params": [
+        "side",
+        "strength"
+      ],
+      "params_schema": {
+        "side": {
+          "type": "string",
+          "enum": [
+            "bullish",
+            "bearish"
+          ],
+          "description": "Direction of the break."
+        },
+        "strength": {
+          "type": "integer",
+          "description": "Swing confirmation strength.",
+          "minimum": 1,
+          "maximum": 10
+        }
+      }
+    },
+    {
+      "type": "moving_average",
+      "title": "Moving average comparison",
+      "description": "Computes an SMA or EMA over a price series and compares it with a numeric threshold or with a candle price field.",
+      "semantics": "above/below: the MA value on the LATEST candle must satisfy the comparison. crosses_above/crosses_below: the latest candle must complete the cross (MA vs the target series). SMA = arithmetic mean of the last ``period`` values; EMA is seeded with the SMA of the first ``period`` values and then smoothed with alpha = 2/(period+1). At least ``period`` candles are required; otherwise unsatisfied with evidence.",
+      "available": true,
+      "status": "operational",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 20,
+      "data_note": "",
+      "required_params": [
+        "ma_type",
+        "period",
+        "compare_to",
+        "operator"
+      ],
+      "params_schema": {
+        "ma_type": {
+          "type": "string",
+          "enum": [
+            "sma",
+            "ema"
+          ],
+          "description": "Moving-average type."
+        },
+        "period": {
+          "type": "integer",
+          "description": "Averaging period.",
+          "minimum": 2,
+          "maximum": 200
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "open",
+            "high",
+            "low",
+            "close"
+          ],
+          "description": "Price field the MA is computed from."
+        },
+        "compare_to": {
+          "type": "string",
+          "enum": [
+            "value",
+            "price_field"
+          ],
+          "description": "What the MA is compared with."
+        },
+        "value": {
+          "type": "number",
+          "description": "Threshold (required when compare_to = value)."
+        },
+        "price_field": {
+          "type": "string",
+          "enum": [
+            "open",
+            "high",
+            "low",
+            "close"
+          ],
+          "description": "Candle field (required when compare_to = price_field)."
+        },
+        "operator": {
+          "type": "string",
+          "enum": [
+            "above",
+            "below",
+            "crosses_above",
+            "crosses_below"
+          ],
+          "description": "Comparison operator."
+        }
+      }
+    },
+    {
+      "type": "price_zone",
+      "title": "Price reaching a user-defined zone",
+      "description": "Defines a zone [zone_low, zone_high] and checks how price interacted with it inside the lookback window.",
+      "semantics": "touched: any candle in the window overlaps the zone (low <= zone_high and high >= zone_low). closed_inside: the LATEST candle's close lies inside the zone (inclusive). rejected: the latest candle touched the zone intrabar but closed outside it. All variants use only supplied candles.",
+      "available": true,
+      "status": "operational",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 20,
+      "data_note": "",
+      "required_params": [
+        "zone_low",
+        "zone_high",
+        "operator"
+      ],
+      "params_schema": {
+        "zone_low": {
+          "type": "number",
+          "description": "Lower boundary of the zone."
+        },
+        "zone_high": {
+          "type": "number",
+          "description": "Upper boundary of the zone."
+        },
+        "operator": {
+          "type": "string",
+          "enum": [
+            "touched",
+            "closed_inside",
+            "rejected"
+          ],
+          "description": "Zone interaction to require."
+        }
+      }
+    },
+    {
+      "type": "mss_choch",
+      "title": "MSS / CHoCH (market structure shift)",
+      "description": "Change of character: a close beyond the opposing confirmed swing that REQUIRES prior opposite structure (two falling swing highs + two falling swing lows for a bullish shift), with an optional displacement filter.",
+      "semantics": "Bullish: the last TWO confirmed swing highs are strictly falling AND the last TWO confirmed swing lows strictly falling (bearish character), then the LATEST candle's close is above the most recent confirmed swing high. Bearish mirrors. displacement=true additionally requires the breaking candle body >= displacement_min_atr * ATR(14). If the prior character cannot be established the rule is INCONCLUSIVE \u2014 a change of character needs a character to change from. This is our precise definition, not a universal ICT standard; swings confirm with `strength` subsequent candles (no look-ahead).",
+      "available": true,
+      "status": "operational",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 60,
+      "data_note": "Needs at least two confirmed swings of each kind plus the breaking candle (~2*strength+3 candles); request enough history.",
+      "required_params": [
+        "direction"
+      ],
+      "params_schema": {
+        "direction": {
+          "type": "string",
+          "enum": [
+            "bullish",
+            "bearish"
+          ],
+          "description": "Direction of the shift."
+        },
+        "strength": {
+          "type": "integer",
+          "description": "Swing confirmation strength.",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "displacement": {
+          "type": "boolean",
+          "description": "Require displacement (body vs ATR) on the breaking candle."
+        },
+        "displacement_min_atr": {
+          "type": "number",
+          "description": "Minimum breaking-candle body in ATR(14) units when displacement is true.",
+          "minimum": 0.1,
+          "maximum": 10.0
+        }
+      }
+    },
+    {
+      "type": "bos",
+      "title": "Break of structure (continuation)",
+      "description": "Break of structure as CONTINUATION: close beyond the most recent confirmed swing in the direction of already-aligned structure (HH+HL for bullish, LH+LL for bearish).",
+      "semantics": "Bullish: the last TWO confirmed swing highs are strictly rising AND the last TWO confirmed swing lows strictly rising (established uptrend character), then the LATEST candle's close is above the most recent confirmed swing high. Bearish mirrors. Without the aligned character the rule is INCONCLUSIVE. The context-free snapshot break is the separate market_structure_break type. Our definition; swings confirm with `strength` subsequent candles (no look-ahead).",
+      "available": true,
+      "status": "operational",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 60,
+      "data_note": "Needs ~2*strength+3 candles (two swings per kind + break).",
+      "required_params": [
+        "direction"
+      ],
+      "params_schema": {
+        "direction": {
+          "type": "string",
+          "enum": [
+            "bullish",
+            "bearish"
+          ],
+          "description": "Direction of the continuation break."
+        },
+        "strength": {
+          "type": "integer",
+          "description": "Swing confirmation strength.",
+          "minimum": 1,
+          "maximum": 10
+        }
+      }
+    },
+    {
+      "type": "liquidity_sweep",
+      "title": "Liquidity sweep",
+      "description": "The latest candle wicks STRICTLY beyond the most recent confirmed swing high/low but CLOSES back on the origin side.",
+      "semantics": "kind=high (buy-side): latest high > most recent confirmed swing high AND latest close < that swing high. kind=low (sell-side): mirror. Wick-through with close-back \u2014 a CLOSE beyond the swing would be a structure break, not a sweep. Equal touches do not sweep (strict inequality). Snapshot: only the latest candle can sweep; the reference swing must have confirmed strictly before it (no look-ahead).",
+      "available": true,
+      "status": "operational",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 40,
+      "data_note": "Needs ~2*strength+2 candles (swing confirmation + sweep).",
+      "required_params": [
+        "kind"
+      ],
+      "params_schema": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "high",
+            "low"
+          ],
+          "description": "Which liquidity pool to test."
+        },
+        "strength": {
+          "type": "integer",
+          "description": "Swing confirmation strength.",
+          "minimum": 1,
+          "maximum": 10
+        }
+      }
+    },
+    {
+      "type": "fvg",
+      "title": "Fair Value Gap",
+      "description": "Three-candle imbalance: bullish when low[i+1] > high[i-1], bearish when high[i+1] < low[i-1], with an explicit mitigation requirement.",
+      "semantics": "requirement=exists: any FVG of the direction in the window. exists_unfilled: at least one FVG never fully filled by a later candle (partial mitigation allowed). exists_untouched: at least one FVG no later candle has traded into. Fill/mitigation is measured ONLY on candles after the gap completes (created at candle i+1's close) \u2014 no look-ahead. Our mitigation taxonomy: full (traded through the entire gap), partial (entered but not through), none.",
+      "available": true,
+      "status": "operational",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 60,
+      "data_note": "",
+      "required_params": [
+        "direction",
+        "requirement"
+      ],
+      "params_schema": {
+        "direction": {
+          "type": "string",
+          "enum": [
+            "bullish",
+            "bearish"
+          ],
+          "description": "Gap direction."
+        },
+        "requirement": {
+          "type": "string",
+          "enum": [
+            "exists",
+            "exists_unfilled",
+            "exists_untouched"
+          ],
+          "description": "Mitigation state to require."
+        }
+      }
+    },
+    {
+      "type": "order_block",
+      "title": "Order block (planned)",
+      "description": "Last opposite candle before displacement.",
+      "semantics": "PLANNED \u2014 not operational. Order-block qualification rules (which displacement counts, mitigation/inversion semantics, exactness of the last-opposite-candle choice) are not finalised. Validation rejects this type.",
+      "available": false,
+      "status": "planned",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 20,
+      "data_note": "",
+      "required_params": [],
+      "params_schema": {}
+    },
+    {
+      "type": "breaker_block",
+      "title": "Breaker block (planned)",
+      "description": "Failed order block used in the opposite direction.",
+      "semantics": "PLANNED \u2014 not operational. Validation rejects this type.",
+      "available": false,
+      "status": "planned",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 20,
+      "data_note": "",
+      "required_params": [],
+      "params_schema": {}
+    },
+    {
+      "type": "support_resistance_reaction",
+      "title": "Support/resistance reaction (planned)",
+      "description": "User-drawn level with expected reaction behaviour.",
+      "semantics": "PLANNED \u2014 not operational. Level management (persistence, break vs reaction) is not finalised. Validation rejects this type.",
+      "available": false,
+      "status": "planned",
+      "supported_modes": [
+        "forex",
+        "binary_options"
+      ],
+      "default_lookback": 20,
+      "data_note": "",
+      "required_params": [],
+      "params_schema": {}
+    }
+  ]
+}

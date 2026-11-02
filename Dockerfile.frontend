@@ -1,0 +1,30 @@
+# TA Platform frontend — Next.js 16 standalone build (bun matches bun.lock).
+FROM oven/bun:1 AS deps
+WORKDIR /app
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
+
+FROM oven/bun:1 AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
+# Public runtime configuration is baked into the client bundle at build time.
+ARG NEXT_PUBLIC_BACKEND_ORIGIN=http://localhost:8000
+ARG NEXT_PUBLIC_BACKEND_PORT=8000
+ENV NEXT_PUBLIC_BACKEND_ORIGIN=$NEXT_PUBLIC_BACKEND_ORIGIN \
+    NEXT_PUBLIC_BACKEND_PORT=$NEXT_PUBLIC_BACKEND_PORT \
+    NEXT_TELEMETRY_DISABLED=1
+
+RUN bun run build
+
+FROM oven/bun:1 AS runner
+WORKDIR /app
+ENV NODE_ENV=production \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0 \
+    NEXT_TELEMETRY_DISABLED=1
+# package.json "build" already assembles .next/standalone (incl. static + public).
+COPY --from=build /app/.next/standalone ./
+EXPOSE 3000
+CMD ["bun", "server.js"]

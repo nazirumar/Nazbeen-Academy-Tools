@@ -1,0 +1,20 @@
+[project]
+name = "ta-platform-backend"
+version = "0.1.0"
+description = "Technical Analysis Platform backend (FastAPI + PostgreSQL)"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+markers = [
+    "integration: tests that require a real PostgreSQL server (provided via pgserver)",
+    "live: optional tests against a REAL MetaTrader 5 terminal (RUN_MT5_LIVE=1 on Windows)",
+]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true

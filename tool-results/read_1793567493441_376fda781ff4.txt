@@ -1,0 +1,784 @@
+     1→"""The versioned JSON rule format — validated, whitelisted, never executed.
+     2→
+     3→This module is the single source of truth for what a strategy rule set may
+     4→contain. Design principles:
+     5→
+     6→1. **Explicit whitelists.** Condition types (registry), parameters,
+     7→   operators, group logic, modes, timeframes and limits are enumerated
+     8→   constants. Anything not whitelisted is rejected with a precise error path
+     9→   suitable for direct display next to the offending editor field.
+    10→2. **No code execution.** A rule set is pure data interpreted by
+    11→   ``app.domains.analysis.evaluator``; there is no ``eval``, no templates, no
+    12→   user-supplied expressions anywhere in the pipeline.
+    13→3. **Versioned.** ``schema_version`` is either ``"2.0"`` (parametric rule
+    14→   types) or ``"1.0"`` (legacy ``price_level``-only flat format, kept for
+    15→   strategies stored by earlier phases — they must remain evaluatable).
+    16→4. **Explainable.** The format separates core conditions, confirmation rules
+    17→   and invalidation rules so the evaluator can report each independently.
+    18→
+    19→A ``2.0`` rule set looks like::
+    20→
+    21→    {
+    22→      "schema_version": "2.0",
+    23→      "mode": "forex",
+    24→      "direction": "both",
+    25→      "timeframes": ["H1", "M15"],
+    26→      "symbols": ["EURUSD"],                      <- optional scope
+    27→      "market_regime": "trending",                <- optional applicability
+    28→      "evaluation": {"on_close_only": true},      <- optional settings
+    29→      "conditions": {                             <- root group (required)
+    30→        "logic": "AND",
+    31→        "conditions": [
+    32→          {"id": "ma-trend", "type": "moving_average", "timeframe": "H1",
+    33→           "lookback": 60,
+    34→           "params": {"ma_type": "ema", "period": 20, "compare_to": "value",
+    35→                       "value": 1.08, "operator": "above"}}
+    36→        ],
+    37→        "groups": [ {"logic": "OR", "conditions": [...], "groups": []} ]
+    38→      },
+    39→      "confirmation": {"logic": "AND", "conditions": [...]},   <- optional
+    40→      "invalidation": {"logic": "AND", "conditions": [...]},   <- optional
+    41→      "notes": "free-form user documentation (optional)"
+    42→    }
+    43→
+    44→Legacy ``1.0`` rule sets keep their flat ``price_level`` shape
+    45→(``field``/``operator``/``value`` directly on the condition) and are
+    46→normalised internally to the parametric form for evaluation.
+    47→"""
+    48→
+    49→from __future__ import annotations
+    50→
+    51→import math
+    52→from dataclasses import dataclass, field
+    53→from typing import Any
+    54→
+    55→from app.domains.market_data.timeframes import (
+    56→    SUPPORTED_TIMEFRAMES,
+    57→    is_timeframe_supported,
+    58→    validate_strategy_timeframes,
+    59→)
+    60→from app.domains.strategies.rule_registry import (
+    61→    AVAILABLE_RULE_TYPES,
+    62→    is_available_type,
+    63→    is_known_type,
+    64→    validate_params,
+    65→)
+    66→
+    67→RULE_SET_SCHEMA_VERSION = "2.0"
+    68→SUPPORTED_SCHEMA_VERSIONS = ("1.0", "2.0")
+    69→
+    70→SUPPORTED_MODES = ("forex", "binary_options")
+    71→DIRECTIONS = ("bullish", "bearish", "both")
+    72→GROUP_LOGIC = ("AND", "OR")
+    73→MARKET_REGIMES = ("any", "trending", "ranging", "volatile", "quiet")
+    74→
+    75→# Condition types that can appear in a VALID rule set (registry "available").
+    76→SUPPORTED_CONDITION_TYPES = AVAILABLE_RULE_TYPES
+    77→PRICE_FIELDS = ("open", "high", "low", "close")
+    78→LEGACY_OPERATORS = ("above", "below", "crosses_above", "crosses_below")
+    79→# Backwards-compatible alias (Phase 1/2 name).
+    80→SUPPORTED_OPERATORS = LEGACY_OPERATORS
+    81→
+    82→LIMITS = {
+    83→    "max_group_depth": 4,
+    84→    "max_conditions_total": 100,
+    85→    "max_conditions_per_group": 25,
+    86→    "lookback_min": 1,
+    87→    "lookback_max": 500,
+    88→    "default_lookback": 20,
+    89→    "id_max_len": 64,
+    90→    "notes_max_len": 2000,
+    91→    "max_timeframes": 6,
+    92→    "max_symbols": 20,
+    93→    "symbol_max_len": 32,
+    94→}
+    95→
+    96→_TOP_LEVEL_KEYS = frozenset(
+    97→    {
+    98→        "schema_version",
+    99→        "mode",
+   100→        "timeframes",
+   101→        "direction",
+   102→        "symbols",
+   103→        "market_regime",
+   104→        "evaluation",
+   105→        "conditions",
+   106→        "confirmation",
+   107→        "invalidation",
+   108→        "notes",
+   109→    }
+   110→)
+   111→_GROUP_KEYS = frozenset({"logic", "conditions", "groups"})
+   112→_CONDITION_KEYS = frozenset(
+   113→    {"id", "type", "timeframe", "lookback", "optional", "params"}
+   114→)
+   115→# Legacy (schema 1.0) flat parameter keys for price_level conditions.
+   116→_LEGACY_CONDITION_KEYS = frozenset({"field", "operator", "value"})
+   117→_EVALUATION_KEYS = frozenset({"on_close_only"})
+   118→
+   119→
+   120→class RuleValidationError(Exception):
+   121→    """Aggregated rule-format validation failure with precise error paths."""
+   122→
+   123→    def __init__(self, errors: list[dict[str, str]]) -> None:
+   124→        self.errors = errors
+   125→        count = len(errors)
+   126→        super().__init__(
+   127→            f"Rule set validation failed with {count} error"
+   128→            f"{'s' if count != 1 else ''}."
+   129→        )
+   130→
+   131→    def to_details(self) -> list[dict[str, str]]:
+   132→        return self.errors
+   133→
+   134→
+   135→# --------------------------------------------------------------------------- #
+   136→# Parsed models (typed output of validation, consumed by the evaluator)
+   137→# --------------------------------------------------------------------------- #
+   138→
+   139→
+   140→@dataclass(frozen=True)
+   141→class Condition:
+   142→    """A single rule, normalised to the parametric (2.0) representation."""
+   143→
+   144→    id: str
+   145→    type: str
+   146→    timeframe: str
+   147→    params: dict[str, Any]
+   148→    lookback: int
+   149→    optional: bool = False
+   150→    # Schema-version bookkeeping for lossless storage round-trips.
+   151→    legacy: bool = False
+   152→
+   153→
+   154→@dataclass(frozen=True)
+   155→class Group:
+   156→    logic: str
+   157→    conditions: tuple[Condition, ...] = ()
+   158→    groups: tuple["Group", ...] = ()
+   159→
+   160→
+   161→@dataclass(frozen=True)
+   162→class RuleSet:
+   163→    schema_version: str
+   164→    mode: str
+   165→    timeframes: tuple[str, ...]
+   166→    direction: str
+   167→    conditions: Group
+   168→    confirmation: Group | None
+   169→    invalidation: Group | None
+   170→    notes: str | None
+   171→    symbols: tuple[str, ...] = ()
+   172→    market_regime: str | None = None
+   173→    evaluation: dict[str, Any] = field(default_factory=dict)
+   174→    condition_ids: frozenset[str] = field(default_factory=frozenset)
+   175→
+   176→    def to_dict(self) -> dict[str, Any]:
+   177→        """Canonical (storage/transport) representation for its version."""
+   178→
+   179→        def condition_dict(c: Condition) -> dict[str, Any]:
+   180→            if c.legacy:
+   181→                # Round-trip the legacy flat shape exactly.
+   182→                return {
+   183→                    "id": c.id,
+   184→                    "type": c.type,
+   185→                    "field": c.params["field"],
+   186→                    "operator": c.params["operator"],
+   187→                    "value": c.params["value"],
+   188→                    "timeframe": c.timeframe,
+   189→                    "lookback": c.lookback,
+   190→                }
+   191→            data: dict[str, Any] = {
+   192→                "id": c.id,
+   193→                "type": c.type,
+   194→                "timeframe": c.timeframe,
+   195→                "lookback": c.lookback,
+   196→                "params": dict(c.params),
+   197→            }
+   198→            if c.optional:
+   199→                data["optional"] = True
+   200→            return data
+   201→
+   202→        def group_dict(g: Group) -> dict[str, Any]:
+   203→            return {
+   204→                "logic": g.logic,
+   205→                "conditions": [condition_dict(c) for c in g.conditions],
+   206→                "groups": [group_dict(nested) for nested in g.groups],
+   207→            }
+   208→
+   209→        data: dict[str, Any] = {
+   210→            "schema_version": self.schema_version,
+   211→            "mode": self.mode,
+   212→            "timeframes": list(self.timeframes),
+   213→            "direction": self.direction,
+   214→            "conditions": group_dict(self.conditions),
+   215→            "confirmation": group_dict(self.confirmation) if self.confirmation else None,
+   216→            "invalidation": group_dict(self.invalidation) if self.invalidation else None,
+   217→        }
+   218→        if self.symbols:
+   219→            data["symbols"] = list(self.symbols)
+   220→        if self.market_regime is not None:
+   221→            data["market_regime"] = self.market_regime
+   222→        if self.evaluation:
+   223→            data["evaluation"] = dict(self.evaluation)
+   224→        if self.notes is not None:
+   225→            data["notes"] = self.notes
+   226→        return data
+   227→
+   228→    def summary_lines(self) -> list[str]:
+   229→        """Human-readable summary (used by the publish preview + tests)."""
+   230→
+   231→        direction_label = {
+   232→            "bullish": "Bullish (long setups)",
+   233→            "bearish": "Bearish (short setups)",
+   234→            "both": "Both directions",
+   235→        }[self.direction]
+   236→        lines = [
+   237→            f"Mode: {self.mode.replace('_', ' ').title()} · "
+   238→            f"schema {self.schema_version} · {direction_label}.",
+   239→            f"Timeframes: {', '.join(self.timeframes)}.",
+   240→        ]
+   241→        if self.symbols:
+   242→            lines.append(f"Symbols: {', '.join(self.symbols)}.")
+   243→        else:
+   244→            lines.append("Symbols: any (no restriction).")
+   245→        if self.market_regime and self.market_regime != "any":
+   246→            lines.append(f"Market regime: {self.market_regime}.")
+   247→        if self.evaluation.get("on_close_only"):
+   248→            lines.append("Evaluation: closed candles only.")
+   249→
+   250→        def count_group(g: Group) -> tuple[int, int]:  # conditions, groups
+   251→            n, gr = len(g.conditions), len(g.groups)
+   252→            for nested in g.groups:
+   253→                a, b = count_group(nested)
+   254→                n, gr = n + a, gr + b
+   255→            return n, gr
+   256→
+   257→        core_n, core_g = count_group(self.conditions)
+   258→        parts = [f"core: {core_n} rule(s) in {core_g + 1} group(s)"]
+   259→        if self.confirmation is not None:
+   260→            c_n, c_g = count_group(self.confirmation)
+   261→            parts.append(f"confirmation: {c_n} rule(s) in {c_g + 1} group(s)")
+   262→        if self.invalidation is not None:
+   263→            i_n, i_g = count_group(self.invalidation)
+   264→            parts.append(f"invalidation: {i_n} rule(s) in {i_g + 1} group(s)")
+   265→        lines.append("Rules — " + "; ".join(parts) + ".")
+   266→        return lines
+   267→
+   268→
+   269→# --------------------------------------------------------------------------- #
+   270→# Validation
+   271→# --------------------------------------------------------------------------- #
+   272→
+   273→
+   274→def validate_rule_set(payload: Any) -> RuleSet:
+   275→    """Validate an arbitrary payload against the whitelisted rule format.
+   276→
+   277→    Collects ALL violations (not just the first) and raises
+   278→    :class:`RuleValidationError` with precise ``path`` entries suitable for
+   279→    direct display in an editor UI.
+   280→    """
+   281→
+   282→    errors: list[dict[str, str]] = []
+   283→
+   284→    def err(path: str, message: str, code: str = "invalid_value") -> None:
+   285→        errors.append({"path": path, "message": message, "code": code})
+   286→
+   287→    if not isinstance(payload, dict):
+   288→        err("$", "Rule set must be a JSON object.", "invalid_type")
+   289→        raise RuleValidationError(errors)
+   290→
+   291→    # --- unknown / missing top-level keys -------------------------------------
+   292→    for key in sorted(set(payload) - _TOP_LEVEL_KEYS):
+   293→        err(
+   294→            f".{key}",
+   295→            f"Unknown key '{key}'. Allowed keys: {', '.join(sorted(_TOP_LEVEL_KEYS))}.",
+   296→            "unknown_key",
+   297→        )
+   298→    for key in ("schema_version", "mode", "timeframes", "direction", "conditions"):
+   299→        if key not in payload:
+   300→            err(f".{key}", f"Missing required key '{key}'.", "missing_key")
+   301→
+   302→    if errors:
+   303→        raise RuleValidationError(errors)
+   304→
+   305→    # --- schema_version --------------------------------------------------------
+   306→    schema_version = payload["schema_version"]
+   307→    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+   308→        err(
+   309→            ".schema_version",
+   310→            f"Unsupported schema version '{schema_version}'. This build "
+   311→            f"supports: {', '.join(SUPPORTED_SCHEMA_VERSIONS)}.",
+   312→            "unsupported_schema_version",
+   313→        )
+   314→        raise RuleValidationError(errors)
+   315→    legacy = schema_version == "1.0"
+   316→
+   317→    # --- mode / timeframes / direction ------------------------------------------
+   318→    mode = payload["mode"]
+   319→    if mode not in SUPPORTED_MODES:
+   320→        err(
+   321→            ".mode",
+   322→            f"Mode '{mode}' is not supported. Supported modes: "
+   323→            f"{', '.join(SUPPORTED_MODES)}.",
+   324→            "unsupported_mode",
+   325→        )
+   326→
+   327→    timeframes = payload["timeframes"]
+   328→    if not isinstance(timeframes, list) or not all(isinstance(t, str) for t in timeframes):
+   329→        err(".timeframes", "timeframes must be a list of timeframe strings.", "invalid_type")
+   330→    elif not timeframes:
+   331→        err(".timeframes", "timeframes must not be empty.", "empty_value")
+   332→    elif len(timeframes) > LIMITS["max_timeframes"]:
+   333→        err(
+   334→            ".timeframes",
+   335→            f"At most {LIMITS['max_timeframes']} timeframes are allowed.",
+   336→            "too_many_items",
+   337→        )
+   338→    elif mode in SUPPORTED_MODES:
+   339→        for tf_err in validate_strategy_timeframes(mode, timeframes):
+   340→            err(".timeframes", tf_err, "unsupported_timeframe")
+   341→        for t in timeframes:
+   342→            if not is_timeframe_supported(t):
+   343→                err(
+   344→                    ".timeframes",
+   345→                    f"Timeframe '{t}' is not supported. Supported: "
+   346→                    f"{', '.join(SUPPORTED_TIMEFRAMES)}.",
+   347→                    "unsupported_timeframe",
+   348→                )
+   349→
+   350→    direction = payload["direction"]
+   351→    if direction not in DIRECTIONS:
+   352→        err(
+   353→            ".direction",
+   354→            f"Direction '{direction}' is not supported. "
+   355→            f"Supported: {', '.join(DIRECTIONS)}.",
+   356→            "unsupported_direction",
+   357→        )
+   358→    elif legacy and direction == "both":
+   359→        err(
+   360→            ".direction",
+   361→            "Direction 'both' requires schema_version 2.0.",
+   362→            "unsupported_direction",
+   363→        )
+   364→
+   365→    # --- symbols (optional scope) -------------------------------------------------
+   366→    symbols_raw = payload.get("symbols")
+   367→    symbols: tuple[str, ...] = ()
+   368→    if symbols_raw is not None:
+   369→        if legacy:
+   370→            err(".symbols", "'symbols' requires schema_version 2.0.", "unknown_key")
+   371→        elif not isinstance(symbols_raw, list) or not all(
+   372→            isinstance(s, str) for s in symbols_raw
+   373→        ):
+   374→            err(".symbols", "symbols must be a list of symbol strings.", "invalid_type")
+   375→        elif len(symbols_raw) > LIMITS["max_symbols"]:
+   376→            err(
+   377→                ".symbols",
+   378→                f"At most {LIMITS['max_symbols']} symbols are allowed.",
+   379→                "too_many_items",
+   380→            )
+   381→        else:
+   382→            cleaned: list[str] = []
+   383→            for i, s in enumerate(symbols_raw):
+   384→                token = s.strip()
+   385→                if not token or len(token) > LIMITS["symbol_max_len"]:
+   386→                    err(
+   387→                        f".symbols[{i}]",
+   388→                        "Each symbol must be a non-empty string of at most "
+   389→                        f"{LIMITS['symbol_max_len']} characters.",
+   390→                        "invalid_symbol",
+   391→                    )
+   392→                elif token in cleaned:
+   393→                    err(
+   394→                        f".symbols[{i}]",
+   395→                        f"Duplicate symbol '{token}'.",
+   396→                        "duplicate_symbol",
+   397→                    )
+   398→                else:
+   399→                    cleaned.append(token)
+   400→            symbols = tuple(cleaned)
+   401→
+   402→    # --- market regime (optional applicability) -----------------------------------
+   403→    market_regime = payload.get("market_regime")
+   404→    if market_regime is not None:
+   405→        if legacy:
+   406→            err(
+   407→                ".market_regime",
+   408→                "'market_regime' requires schema_version 2.0.",
+   409→                "unknown_key",
+   410→            )
+   411→        elif market_regime not in MARKET_REGIMES:
+   412→            err(
+   413→                ".market_regime",
+   414→                f"Market regime '{market_regime}' is not supported. Supported: "
+   415→                f"{', '.join(MARKET_REGIMES)}.",
+   416→                "unsupported_market_regime",
+   417→            )
+   418→
+   419→    # --- evaluation settings (optional) ---------------------------------------------
+   420→    evaluation_raw = payload.get("evaluation")
+   421→    evaluation: dict[str, Any] = {}
+   422→    if evaluation_raw is not None:
+   423→        if legacy:
+   424→            err(
+   425→                ".evaluation",
+   426→                "'evaluation' requires schema_version 2.0.",
+   427→                "unknown_key",
+   428→            )
+   429→        elif not isinstance(evaluation_raw, dict):
+   430→            err(".evaluation", "evaluation must be a JSON object.", "invalid_type")
+   431→        else:
+   432→            for key in sorted(set(evaluation_raw) - _EVALUATION_KEYS):
+   433→                err(
+   434→                    f".evaluation.{key}",
+   435→                    f"Unknown evaluation setting '{key}'. Allowed: "
+   436→                    f"{', '.join(sorted(_EVALUATION_KEYS))}.",
+   437→                    "unknown_key",
+   438→                )
+   439→            on_close = evaluation_raw.get("on_close_only")
+   440→            if on_close is not None and not isinstance(on_close, bool):
+   441→                err(
+   442→                    ".evaluation.on_close_only",
+   443→                    "on_close_only must be a boolean.",
+   444→                    "invalid_type",
+   445→                )
+   446→            evaluation = {
+   447→                k: v for k, v in evaluation_raw.items() if k in _EVALUATION_KEYS
+   448→            }
+   449→
+   450→    notes = payload.get("notes")
+   451→    if notes is not None:
+   452→        if not isinstance(notes, str):
+   453→            err(".notes", "notes must be a string.", "invalid_type")
+   454→        elif len(notes) > LIMITS["notes_max_len"]:
+   455→            err(
+   456→                ".notes",
+   457→                f"notes must not exceed {LIMITS['notes_max_len']} characters.",
+   458→                "too_long",
+   459→            )
+   460→
+   461→    # --- condition groups ---------------------------------------------------------
+   462→    seen_condition_ids: set[str] = set()
+   463→    total_conditions = [0]  # boxed counter shared across recursion
+   464→
+   465→    def parse_condition(node: Any, path: str, seen_ids: set[str]) -> Condition | None:
+   466→        errors_before = len(errors)
+   467→        if not isinstance(node, dict):
+   468→            err(path, "Condition must be a JSON object.", "invalid_type")
+   469→            return None
+   470→
+   471→        allowed_keys = (
+   472→            _CONDITION_KEYS | _LEGACY_CONDITION_KEYS if legacy else _CONDITION_KEYS
+   473→        )
+   474→        for key in sorted(set(node) - allowed_keys):
+   475→            if (
+   476→                not legacy
+   477→                and key in _LEGACY_CONDITION_KEYS
+   478→                and node.get("type") == "price_level"
+   479→            ):
+   480→                err(
+   481→                    f"{path}.{key}",
+   482→                    f"'{key}' belongs inside the 'params' object in schema "
+   483→                    "version 2.0.",
+   484→                    "unknown_key",
+   485→                )
+   486→            else:
+   487→                err(
+   488→                    f"{path}.{key}",
+   489→                    f"Unknown key '{key}' in condition. Allowed: "
+   490→                    f"{', '.join(sorted(allowed_keys))}.",
+   491→                    "unknown_key",
+   492→                )
+   493→
+   494→        for key in ("type", "timeframe"):
+   495→            if key not in node:
+   496→                err(f"{path}.{key}", f"Condition requires '{key}'.", "missing_key")
+   497→
+   498→        cond_type = node.get("type")
+   499→        if not isinstance(cond_type, str) or not cond_type:
+   500→            err(
+   501→                f"{path}.type",
+   502→                "Condition type must be a non-empty string.",
+   503→                "invalid_type",
+   504→            )
+   505→        elif not is_known_type(cond_type):
+   506→            err(
+   507→                f"{path}.type",
+   508→                f"Condition type '{cond_type}' is not supported. Supported "
+   509→                f"types: {', '.join(AVAILABLE_RULE_TYPES)}.",
+   510→                "unsupported_condition_type",
+   511→            )
+   512→        elif not is_available_type(cond_type):
+   513→            err(
+   514→                f"{path}.type",
+   515→                f"Rule type '{cond_type}' exists in the registry but is NOT "
+   516→                "operational yet (planned). It cannot be used in strategies "
+   517→                "until its semantics and tests are complete.",
+   518→                "rule_type_not_available",
+   519→            )
+   520→        elif legacy and cond_type != "price_level":
+   521→            err(
+   522→                f"{path}.type",
+   523→                f"Schema version 1.0 supports the 'price_level' rule type "
+   524→                f"only (got '{cond_type}'). Use schema_version 2.0 for the "
+   525→                "extended rule types.",
+   526→                "unsupported_condition_type",
+   527→            )
+   528→
+   529→        cond_timeframe = node.get("timeframe")
+   530→        if isinstance(cond_timeframe, str) and isinstance(timeframes, list):
+   531→            if not is_timeframe_supported(cond_timeframe):
+   532→                err(
+   533→                    f"{path}.timeframe",
+   534→                    f"Timeframe '{cond_timeframe}' is not supported.",
+   535→                    "unsupported_timeframe",
+   536→                )
+   537→            elif cond_timeframe not in timeframes:
+   538→                err(
+   539→                    f"{path}.timeframe",
+   540→                    f"Timeframe '{cond_timeframe}' must be declared in the "
+   541→                    "rule set's top-level 'timeframes' list first.",
+   542→                    "undeclared_timeframe",
+   543→                )
+   544→
+   545→        lookback = node.get("lookback")
+   546→        default_lookback = 20
+   547→        if not legacy and is_known_type(cond_type or ""):
+   548→            from app.domains.strategies.rule_registry import get_spec
+   549→
+   550→            default_lookback = get_spec(cond_type).default_lookback
+   551→        if lookback is None:
+   552→            lookback = default_lookback
+   553→        if (
+   554→            isinstance(lookback, bool)
+   555→            or not isinstance(lookback, int)
+   556→            or not (LIMITS["lookback_min"] <= lookback <= LIMITS["lookback_max"])
+   557→        ):
+   558→            err(
+   559→                f"{path}.lookback",
+   560→                f"lookback must be an integer between "
+   561→                f"{LIMITS['lookback_min']} and {LIMITS['lookback_max']}.",
+   562→                "invalid_lookback",
+   563→            )
+   564→            lookback = default_lookback
+   565→
+   566→        optional = node.get("optional", False)
+   567→        if optional is None:
+   568→            optional = False
+   569→        if not isinstance(optional, bool):
+   570→            err(
+   571→                f"{path}.optional",
+   572→                "optional must be a boolean.",
+   573→                "invalid_type",
+   574→            )
+   575→            optional = False
+   576→        elif optional and legacy:
+   577→            err(
+   578→                f"{path}.optional",
+   579→                "'optional' requires schema_version 2.0.",
+   580→                "unknown_key",
+   581→            )
+   582→
+   583→        # ---- params (2.0) or legacy flat keys (1.0) ------------------------------
+   584→        params: dict[str, Any] = {}
+   585→        if legacy:
+   586→            for key in ("field", "operator", "value"):
+   587→                if key not in node:
+   588→                    err(
+   589→                        f"{path}.{key}",
+   590→                        f"Legacy price_level conditions require '{key}'.",
+   591→                        "missing_key",
+   592→                    )
+   593→            if not errors[errors_before:]:
+   594→                params = {
+   595→                    "field": node.get("field"),
+   596→                    "operator": node.get("operator"),
+   597→                    "value": node.get("value"),
+   598→                }
+   599→                from app.domains.strategies.rule_registry import validate_params as _vp
+   600→
+   601→                params, param_errors = _vp("price_level", params, path=path)
+   602→                errors.extend(param_errors)
+   603→        else:
+   604→            raw_params = node.get("params")
+   605→            if is_known_type(cond_type or "") and is_available_type(cond_type or ""):
+   606→                raw_params = raw_params if raw_params is not None else {}
+   607→                params, param_errors = validate_params(
+   608→                    cond_type, raw_params, path=f"{path}.params"
+   609→                )
+   610→                errors.extend(param_errors)
+   611→            elif raw_params is not None and not isinstance(raw_params, dict):
+   612→                err(f"{path}.params", "params must be a JSON object.", "invalid_type")
+   613→
+   614→        cond_id = node.get("id")
+   615→        if cond_id is None:
+   616→            cond_id = f"cond_{len(seen_ids) + 1}"
+   617→        if not isinstance(cond_id, str) or not cond_id:
+   618→            err(f"{path}.id", "id must be a non-empty string.", "invalid_id")
+   619→            cond_id = f"cond_invalid_{len(seen_ids) + 1}"
+   620→        elif len(cond_id) > LIMITS["id_max_len"]:
+   621→            err(
+   622→                f"{path}.id",
+   623→                f"id must not exceed {LIMITS['id_max_len']} characters.",
+   624→                "too_long",
+   625→            )
+   626→        elif cond_id in seen_ids:
+   627→            err(
+   628→                f"{path}.id",
+   629→                f"Duplicate condition id '{cond_id}'. Condition ids must be "
+   630→                "unique within a rule set.",
+   631→                "duplicate_id",
+   632→            )
+   633→        else:
+   634→            seen_ids.add(cond_id)
+   635→
+   636→        # Skip the condition only when *its own* subtree produced errors;
+   637→        # errors from unrelated parts of the document must not hide it.
+   638→        own_errors = any(
+   639→            entry["path"].startswith(f"{path}.") for entry in errors[errors_before:]
+   640→        )
+   641→        if own_errors:
+   642→            return None
+   643→        return Condition(
+   644→            id=cond_id,
+   645→            type=str(cond_type or ""),
+   646→            timeframe=str(cond_timeframe or ""),
+   647→            params=dict(params),
+   648→            lookback=int(lookback),
+   649→            optional=bool(optional),
+   650→            legacy=legacy,
+   651→        )
+   652→
+   653→    def parse_group(node: Any, path: str, depth: int) -> Group | None:
+   654→        if not isinstance(node, dict):
+   655→            err(path, "Condition group must be a JSON object.", "invalid_type")
+   656→            return None
+   657→        for key in sorted(set(node) - _GROUP_KEYS):
+   658→            err(
+   659→                f"{path}.{key}",
+   660→                f"Unknown key '{key}' in group. Allowed: "
+   661→                f"{', '.join(sorted(_GROUP_KEYS))}.",
+   662→                "unknown_key",
+   663→            )
+   664→        if "logic" not in node:
+   665→            err(f"{path}.logic", "Group requires a 'logic' key.", "missing_key")
+   666→            return None
+   667→        logic = node["logic"]
+   668→        if logic not in GROUP_LOGIC:
+   669→            err(
+   670→                f"{path}.logic",
+   671→                f"Group logic '{logic}' is not supported. "
+   672→                f"Supported: {', '.join(GROUP_LOGIC)}.",
+   673→                "unsupported_logic",
+   674→            )
+   675→            logic = "AND"
+   676→
+   677→        raw_conditions = node.get("conditions", [])
+   678→        raw_groups = node.get("groups", [])
+   679→        if not isinstance(raw_conditions, list):
+   680→            err(f"{path}.conditions", "conditions must be a list.", "invalid_type")
+   681→            raw_conditions = []
+   682→        if not isinstance(raw_groups, list):
+   683→            err(f"{path}.groups", "groups must be a list.", "invalid_type")
+   684→            raw_groups = []
+   685→        if not raw_conditions and not raw_groups:
+   686→            err(
+   687→                path,
+   688→                "Group must contain at least one condition or nested group.",
+   689→                "empty_group",
+   690→            )
+   691→
+   692→        if len(raw_conditions) > LIMITS["max_conditions_per_group"]:
+   693→            err(
+   694→                f"{path}.conditions",
+   695→                f"At most {LIMITS['max_conditions_per_group']} conditions per group.",
+   696→                "too_many_items",
+   697→            )
+   698→
+   699→        conditions: list[Condition] = []
+   700→        for i, raw in enumerate(raw_conditions[: LIMITS["max_conditions_per_group"]]):
+   701→            cond = parse_condition(raw, f"{path}.conditions[{i}]", seen_condition_ids)
+   702→            if cond is not None:
+   703→                conditions.append(cond)
+   704→                total_conditions[0] += 1
+   705→        if depth >= LIMITS["max_group_depth"]:
+   706→            err(
+   707→                f"{path}.groups",
+   708→                f"Nesting exceeds the maximum group depth of "
+   709→                f"{LIMITS['max_group_depth']}.",
+   710→                "max_depth_exceeded",
+   711→            )
+   712→            nested: list[Group] = []
+   713→        else:
+   714→            nested = []
+   715→            for i, child in enumerate(raw_groups):
+   716→                child_group = parse_group(child, f"{path}.groups[{i}]", depth + 1)
+   717→                if child_group is not None:
+   718→                    nested.append(child_group)
+   719→
+   720→        return Group(
+   721→            logic=logic,
+   722→            conditions=tuple(conditions),
+   723→            groups=tuple(nested),
+   724→        )
+   725→
+   726→    root_group = parse_group(payload.get("conditions"), ".conditions", depth=1)
+   727→
+   728→    confirmation: Group | None = None
+   729→    invalidation: Group | None = None
+   730→    if payload.get("confirmation") is not None:
+   731→        confirmation = parse_group(payload["confirmation"], ".confirmation", depth=1)
+   732→    if payload.get("invalidation") is not None:
+   733→        invalidation = parse_group(payload["invalidation"], ".invalidation", depth=1)
+   734→
+   735→    if total_conditions[0] > LIMITS["max_conditions_total"]:
+   736→        err(
+   737→            "$",
+   738→            f"Rule set exceeds the maximum of "
+   739→            f"{LIMITS['max_conditions_total']} conditions in total.",
+   740→            "too_many_conditions",
+   741→        )
+   742→
+   743→    if errors:
+   744→        raise RuleValidationError(errors)
+   745→    if root_group is None:
+   746→        err(".conditions", "Root condition group is missing or invalid.", "missing_key")
+   747→        raise RuleValidationError(errors)
+   748→
+   749→    return RuleSet(
+   750→        schema_version=str(schema_version),
+   751→        mode=str(mode),
+   752→        timeframes=tuple(timeframes) if isinstance(timeframes, list) else (),
+   753→        direction=str(direction),
+   754→        conditions=root_group,
+   755→        confirmation=confirmation,
+   756→        invalidation=invalidation,
+   757→        notes=notes if isinstance(notes, str) else None,
+   758→        symbols=symbols,
+   759→        market_regime=market_regime if isinstance(market_regime, str) else None,
+   760→        evaluation=dict(evaluation),
+   761→        condition_ids=frozenset(seen_condition_ids),
+   762→    )
+   763→
+   764→
+   765→# Re-exported for convenience by routers / meta endpoint.
+   766→__all__ = [
+   767→    "RULE_SET_SCHEMA_VERSION",
+   768→    "SUPPORTED_SCHEMA_VERSIONS",
+   769→    "SUPPORTED_CONDITION_TYPES",
+   770→    "SUPPORTED_MODES",
+   771→    "LEGACY_OPERATORS",
+   772→    "SUPPORTED_OPERATORS",
+   773→    "DIRECTIONS",
+   774→    "GROUP_LOGIC",
+   775→    "PRICE_FIELDS",
+   776→    "MARKET_REGIMES",
+   777→    "LIMITS",
+   778→    "Condition",
+   779→    "Group",
+   780→    "RuleSet",
+   781→    "RuleValidationError",
+   782→    "validate_rule_set",
+   783→]
+   784→

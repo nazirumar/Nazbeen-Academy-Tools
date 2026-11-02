@@ -1,0 +1,8 @@
+{
+  "name": "ta-api",
+  "private": true,
+  "description": "FastAPI backend for the TA platform (started by the dev chain)",
+  "scripts": {
+    "dev": "bash ../../scripts/start-backend.sh"
+  }
+}

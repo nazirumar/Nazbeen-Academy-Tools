@@ -1,0 +1,1416 @@
+     1→"""Deterministic, explainable rule evaluation.
+     2→
+     3→Semantics (documented in README, /api/v1/rule-types and /api/v1/meta):
+     4→
+     5→- ``price_level`` — ``above``/``below``: the **latest candle** in the
+     6→  lookback window satisfies the comparison; ``crosses_above``/
+     7→  ``crosses_below``: the latest candle completes the cross.
+     8→- ``candle_property`` — derived property of the latest candle vs a
+     9→  threshold.
+    10→- ``candle_pattern`` — classic pattern on the latest 1-2 candles.
+    11→- ``swing_point`` — a swing of the given strength CONFIRMED inside the
+    12→  window (confirmed = ``strength`` subsequent candles exist inside the
+    13→  supplied data; nothing from the future is assumed).
+    14→- ``structure_pattern`` — the last N confirmed swings are strictly
+    15→  rising/falling (HH / HL / LH / LL).
+    16→- ``market_structure_break`` — latest close beyond the most recent
+    17→  confirmed opposite swing (generic, precisely-defined BOS).
+    18→- ``moving_average`` — SMA/EMA vs a threshold or a price field, with
+    19→  fresh-cross semantics for ``crosses_*``.
+    20→- ``price_zone`` — interaction with a user-defined [low, high] zone.
+    21→- Group logic (four-state aware):
+    22→    * ``AND`` — met only when EVERY required child is ``met``. A single
+    23→      ``not_met`` child fails the group; any ``inconclusive`` or
+    24→      ``unsupported`` child prevents a ``met`` outcome (unknown is
+    25→      never converted into success).
+    26→    * ``OR``  — met when at least one required child is ``met``. If none
+    27→      is met, unavailable children (inconclusive/unsupported) surface as
+    28→      the group status — they are never concealed.
+    29→- Condition/group status: ``met`` | ``not_met`` | ``inconclusive`` |
+    30→  ``unsupported``. ``inconclusive`` means "cannot be evaluated from the
+    31→  supplied data" (insufficient history, missing reference) — distinct
+    32→  from ``not_met`` (evaluated and the criterion failed).
+    33→- Overall status:
+    34→    * ``invalidated``            — the invalidation group is satisfied
+    35→    * ``regime_mismatch``        — the strategy requires a market regime
+    36→      the classifier did not confirm (unknown regimes never match)
+    37→    * ``conditions_met``         — core met AND confirmation (if any) met
+    38→    * ``conditions_missing``     — core or confirmation evaluated and not met
+    39→    * ``inconclusive``           — core/confirmation could not be fully
+    40→      evaluated (insufficient data, unsupported rule type)
+    41→    * ``insufficient_data``      — at least one referenced timeframe has no usable data
+    42→
+    43→**Closed candles by default.** When candles carry ``forming: true`` and
+    44→the rule set does not disable ``evaluation.on_close_only`` (default
+    45→True), forming candles are EXCLUDED from evaluation with an explicit
+    46→warning. If forming-candle analysis is explicitly enabled, results are
+    47→labelled provisional.
+    48→
+    49→**No look-ahead bias**: every evaluator is a pure function of the candles
+    50→supplied at evaluation time. A condition never uses information that was
+    51→unavailable when the last supplied candle closed (swing confirmation
+    52→explicitly requires ``strength`` candles AFTER the swing inside the data;
+    53→confirmation times come from the shared feature library).
+    54→
+    55→The evaluator never fetches or invents market data.
+    56→"""
+    57→
+    58→from __future__ import annotations
+    59→
+    60→import math
+    61→from dataclasses import dataclass, field
+    62→from typing import Any
+    63→
+    64→from app.domains.analysis.features import confirmed_swings as _feature_swings
+    65→from app.domains.analysis.quality import assess_candle_series
+    66→from app.domains.strategies.rules import Condition, Group, RuleSet
+    67→
+    68→# Condition/group result states. ``met``/``not_met`` are definitive;
+    69→# ``inconclusive`` means the condition could not be evaluated from the
+    70→# supplied data; ``unsupported`` means no evaluator exists for the type.
+    71→STATUS_MET = "met"
+    72→STATUS_NOT_MET = "not_met"
+    73→STATUS_INCONCLUSIVE = "inconclusive"
+    74→STATUS_UNSUPPORTED = "unsupported"
+    75→CONDITION_STATUSES = (STATUS_MET, STATUS_NOT_MET, STATUS_INCONCLUSIVE, STATUS_UNSUPPORTED)
+    76→
+    77→
+    78→@dataclass
+    79→class NodeResult:
+    80→    """Evaluation result for a condition OR a group (explainability tree)."""
+    81→
+    82→    kind: str  # "condition" | "group"
+    83→    id: str
+    84→    logic: str | None  # groups only
+    85→    status: str  # met | not_met | inconclusive | unsupported
+    86→    description: str
+    87→    evidence: dict[str, Any] = field(default_factory=dict)
+    88→    children: list["NodeResult"] = field(default_factory=list)
+    89→    optional: bool = False
+    90→
+    91→    @property
+    92→    def satisfied(self) -> bool:
+    93→        """Backwards-compatible view: only ``met`` counts as satisfied."""
+    94→
+    95→        return self.status == STATUS_MET
+    96→
+    97→    def to_dict(self) -> dict[str, Any]:
+    98→        data: dict[str, Any] = {
+    99→            "kind": self.kind,
+   100→            "id": self.id,
+   101→            "status": self.status,
+   102→            "satisfied": self.satisfied,
+   103→            "description": self.description,
+   104→            "evidence": self.evidence,
+   105→        }
+   106→        if self.optional:
+   107→            data["optional"] = True
+   108→        if self.kind == "group":
+   109→            data["logic"] = self.logic
+   110→            data["children"] = [child.to_dict() for child in self.children]
+   111→        return data
+   112→
+   113→
+   114→@dataclass
+   115→class EvaluationResult:
+   116→    direction: str
+   117→    setup_status: str
+   118→    core: NodeResult
+   119→    confirmation: NodeResult | None
+   120→    invalidation: NodeResult | None
+   121→    warnings: list[dict[str, Any]]
+   122→    summary: list[str]
+   123→    evaluated_at: str
+   124→    core_status: str = STATUS_NOT_MET
+   125→    confirmation_status: str | None = None
+   126→    invalidation_status: str | None = None
+   127→    conditions_summary: dict[str, int] = field(default_factory=dict)
+   128→    closed_candles_only: bool = True
+   129→    forming_candle_used: bool = False
+   130→
+   131→    def to_dict(self) -> dict[str, Any]:
+   132→        return {
+   133→            "direction": self.direction,
+   134→            "setup_status": self.setup_status,
+   135→            "core": self.core.to_dict(),
+   136→            "confirmation": self.confirmation.to_dict() if self.confirmation else None,
+   137→            "invalidation": self.invalidation.to_dict() if self.invalidation else None,
+   138→            "core_status": self.core_status,
+   139→            "confirmation_status": self.confirmation_status,
+   140→            "invalidation_status": self.invalidation_status,
+   141→            "conditions_summary": self.conditions_summary,
+   142→            "closed_candles_only": self.closed_candles_only,
+   143→            "forming_candle_used": self.forming_candle_used,
+   144→            "warnings": self.warnings,
+   145→            "summary": self.summary,
+   146→            "evaluated_at": self.evaluated_at,
+   147→        }
+   148→
+   149→
+   150→# --------------------------------------------------------------------------- #
+   151→# Shared helpers
+   152→# --------------------------------------------------------------------------- #
+   153→
+   154→
+   155→def _series_from(candles: list[dict[str, Any]], price_field: str) -> list[float]:
+   156→    return [float(c[price_field]) for c in candles]
+   157→
+   158→
+   159→def _window(candles: list[dict[str, Any]], lookback: int) -> list[dict[str, Any]]:
+   160→    return candles[-lookback:] if lookback and len(candles) >= lookback else candles
+   161→
+   162→
+   163→def _unsatisfied(
+   164→    condition: Condition, description: str, evidence: dict[str, Any], reason: str
+   165→) -> NodeResult:
+   166→    """A condition that could NOT be evaluated -> ``inconclusive``.
+   167→
+   168→    Used exclusively for data-insufficiency paths (no candles, not enough
+   169→    history, missing reference). This is deliberately distinct from a
+   170→    condition that was evaluated and failed.
+   171→    """
+   172→
+   173→    evidence = dict(evidence)
+   174→    evidence["reason"] = reason
+   175→    return NodeResult(
+   176→        kind="condition",
+   177→        id=condition.id,
+   178→        logic=None,
+   179→        status=STATUS_INCONCLUSIVE,
+   180→        description=description,
+   181→        evidence=evidence,
+   182→        optional=condition.optional,
+   183→    )
+   184→
+   185→
+   186→def _node(condition: Condition, description: str, evidence: dict[str, Any], satisfied: bool) -> NodeResult:
+   187→    """An EVALUATED condition outcome (definitive met / not_met)."""
+   188→
+   189→    return NodeResult(
+   190→        kind="condition",
+   191→        id=condition.id,
+   192→        logic=None,
+   193→        status=STATUS_MET if satisfied else STATUS_NOT_MET,
+   194→        description=description,
+   195→        evidence=evidence,
+   196→        optional=condition.optional,
+   197→    )
+   198→
+   199→
+   200→def _crossover_satisfied(
+   201→    operator: str,
+   202→    series_a: list[float],
+   203→    series_b: list[float],
+   204→) -> tuple[bool, list[int]]:
+   205→    """Shared fresh-cross semantics. Returns (satisfied, cross_indices)."""
+   206→
+   207→    crosses: list[int] = []
+   208→    for i in range(1, len(series_a)):
+   209→        prev, cur = series_a[i - 1], series_a[i]
+   210→        if operator == "crosses_above":
+   211→            hit = prev <= series_b[i - 1] and cur > series_b[i]
+   212→        else:
+   213→            hit = prev >= series_b[i - 1] and cur < series_b[i]
+   214→        if hit:
+   215→            crosses.append(i)
+   216→    satisfied = bool(crosses) and crosses[-1] == len(series_a) - 1
+   217→    return satisfied, crosses
+   218→
+   219→
+   220→# --------------------------------------------------------------------------- #
+   221→# price_level
+   222→# --------------------------------------------------------------------------- #
+   223→
+   224→
+   225→def evaluate_price_level_condition(
+   226→    condition: Condition, candles: list[dict[str, Any]]
+   227→) -> NodeResult:
+   228→    """Evaluate a ``price_level`` condition with full evidence."""
+   229→
+   230→    tf = condition.timeframe
+   231→    lookback = condition.lookback
+   232→    window = _window(candles, lookback)
+   233→    field = str(condition.params["field"])
+   234→    operator = str(condition.params["operator"])
+   235→    threshold = float(condition.params["value"])
+   236→    needs_two = operator in ("crosses_above", "crosses_below")
+   237→    series = _series_from(window, field)
+   238→
+   239→    description = (
+   240→        f"{field} {operator.replace('_', ' ')} "
+   241→        f"{threshold:g} on {tf} (last {len(window)} candle(s))"
+   242→    )
+   243→    evidence: dict[str, Any] = {
+   244→        "condition_type": condition.type,
+   245→        "timeframe": tf,
+   246→        "field": field,
+   247→        "operator": operator,
+   248→        "threshold": threshold,
+   249→        "lookback": lookback,
+   250→        "candles_evaluated": len(window),
+   251→        "candles_available": len(candles),
+   252→    }
+   253→
+   254→    if not window or (needs_two and len(window) < 2):
+   255→        return _unsatisfied(
+   256→            condition,
+   257→            description,
+   258→            evidence,
+   259→            reason=(
+   260→                "Cross conditions need at least 2 candles in the window."
+   261→                if needs_two
+   262→                else "No usable candles for this timeframe."
+   263→            ),
+   264→        )
+   265→
+   266→    if operator in ("above", "below"):
+   267→        comparisons = [
+   268→            (v > threshold) if operator == "above" else (v < threshold) for v in series
+   269→        ]
+   270→        satisfied = comparisons[-1]
+   271→        matched = sum(comparisons)
+   272→        first_hit = next(
+   273→            (window[i]["time"] for i, hit in enumerate(comparisons) if hit), None
+   274→        )
+   275→        last_hit = next(
+   276→            (window[i]["time"] for i in range(len(comparisons) - 1, -1, -1) if comparisons[i]),
+   277→            None,
+   278→        )
+   279→        evidence.update(
+   280→            {
+   281→                "current_value": series[-1],
+   282→                "matched_count": matched,
+   283→                "first_satisfied_time": first_hit,
+   284→                "last_satisfied_time": last_hit,
+   285→                "criterion": "latest candle must satisfy the comparison",
+   286→            }
+   287→        )
+   288→    else:  # crosses_above / crosses_below
+   289→        crosses: list[dict[str, Any]] = []
+   290→        for i in range(1, len(series)):
+   291→            prev, cur = series[i - 1], series[i]
+   292→            if operator == "crosses_above":
+   293→                hit = prev <= threshold < cur
+   294→            else:
+   295→                hit = prev >= threshold > cur
+   296→            if hit:
+   297→                crosses.append({"time": window[i]["time"], "value": cur})
+   298→        # Documented semantics: the FRESH cross decides — the latest candle
+   299→        # must be the one completing the cross.
+   300→        satisfied = bool(crosses) and crosses[-1]["time"] == window[-1]["time"]
+   301→        evidence.update(
+   302→            {
+   303→                "current_value": series[-1],
+   304→                "previous_value": series[-2],
+   305→                "crosses_in_window": crosses[-10:],  # cap for payload size
+   306→                "total_crosses_in_window": len(crosses),
+   307→                "last_cross_time": crosses[-1]["time"] if crosses else None,
+   308→                "criterion": "latest candle must complete the cross",
+   309→            }
+   310→        )
+   311→
+   312→    return _node(condition, description, evidence, satisfied)
+   313→
+   314→
+   315→# --------------------------------------------------------------------------- #
+   316→# candle_property
+   317→# --------------------------------------------------------------------------- #
+   318→
+   319→
+   320→def _candle_property_value(candle: dict[str, Any], prop: str) -> float:
+   321→    o, h, l, c = (float(candle[k]) for k in ("open", "high", "low", "close"))
+   322→    if prop in ("open", "high", "low", "close"):
+   323→        return {"open": o, "high": h, "low": l, "close": c}[prop]
+   324→    if prop == "body":
+   325→        return abs(c - o)
+   326→    if prop == "range":
+   327→        return h - l
+   328→    if prop == "upper_wick":
+   329→        return h - max(o, c)
+   330→    if prop == "lower_wick":
+   331→        return min(o, c) - l
+   332→    raise ValueError(f"Unknown candle property '{prop}'")  # pragma: no cover
+   333→
+   334→
+   335→def evaluate_candle_property(
+   336→    condition: Condition, candles: list[dict[str, Any]]
+   337→) -> NodeResult:
+   338→    tf = condition.timeframe
+   339→    prop = str(condition.params["property"])
+   340→    operator = str(condition.params["operator"])
+   341→    threshold = float(condition.params["value"])
+   342→    window = _window(candles, condition.lookback)
+   343→
+   344→    description = (
+   345→        f"{prop.replace('_', ' ')} {operator} {threshold:g} on {tf} "
+   346→        "(latest candle)"
+   347→    )
+   348→    evidence: dict[str, Any] = {
+   349→        "condition_type": condition.type,
+   350→        "timeframe": tf,
+   351→        "property": prop,
+   352→        "operator": operator,
+   353→        "threshold": threshold,
+   354→        "candles_evaluated": len(window),
+   355→        "candles_available": len(candles),
+   356→    }
+   357→    if not window:
+   358→        return _unsatisfied(
+   359→            condition, description, evidence, "No usable candles for this timeframe."
+   360→        )
+   361→    value = _candle_property_value(window[-1], prop)
+   362→    satisfied = value > threshold if operator == "above" else value < threshold
+   363→    evidence.update(
+   364→        {
+   365→            "current_value": value,
+   366→            "criterion": "property of the latest candle must satisfy the comparison",
+   367→        }
+   368→    )
+   369→    return _node(condition, description, evidence, satisfied)
+   370→
+   371→
+   372→# --------------------------------------------------------------------------- #
+   373→# candle_pattern
+   374→# --------------------------------------------------------------------------- #
+   375→
+   376→
+   377→def evaluate_candle_pattern(
+   378→    condition: Condition, candles: list[dict[str, Any]]
+   379→) -> NodeResult:
+   380→    tf = condition.timeframe
+   381→    pattern = str(condition.params["pattern"])
+   382→    max_body_ratio = float(condition.params.get("max_body_ratio", 0.1))
+   383→    window = _window(candles, condition.lookback)
+   384→
+   385→    description = f"{pattern.replace('_', ' ')} on {tf} (latest candle)"
+   386→    evidence: dict[str, Any] = {
+   387→        "condition_type": condition.type,
+   388→        "timeframe": tf,
+   389→        "pattern": pattern,
+   390→        "candles_evaluated": len(window),
+   391→        "candles_available": len(candles),
+   392→    }
+   393→    if not window:
+   394→        return _unsatisfied(
+   395→            condition, description, evidence, "No usable candles for this timeframe."
+   396→        )
+   397→    needs_two = pattern in ("bullish_engulfing", "bearish_engulfing", "inside_bar")
+   398→    if needs_two and len(window) < 2:
+   399→        return _unsatisfied(
+   400→            condition,
+   401→            description,
+   402→            evidence,
+   403→            reason=f"Pattern '{pattern}' needs at least 2 candles.",
+   404→        )
+   405→
+   406→    cur, prev = window[-1], window[-2] if len(window) > 1 else None
+   407→
+   408→    def body(c: dict[str, Any]) -> float:
+   409→        return abs(float(c["close"]) - float(c["open"]))
+   410→
+   411→    def is_bull(c: dict[str, Any]) -> bool:
+   412→        return float(c["close"]) > float(c["open"])
+   413→
+   414→    def is_bear(c: dict[str, Any]) -> bool:
+   415→        return float(c["close"]) < float(c["open"])
+   416→
+   417→    rng = float(cur["high"]) - float(cur["low"])
+   418→    body_cur = body(cur)
+   419→    if rng <= 0:
+   420→        matched = pattern == "doji"  # a zero-range candle is a perfect doji
+   421→        evidence.update({"pattern_range": 0.0, "criterion": pattern})
+   422→        return _node(condition, description, evidence, bool(matched))
+   423→
+   424→    matched = False
+   425→    detail: dict[str, Any] = {"criterion": pattern}
+   426→    if pattern == "bullish_engulfing" and prev is not None:
+   427→        matched = (
+   428→            is_bear(prev)
+   429→            and is_bull(cur)
+   430→            and float(cur["open"]) <= float(prev["close"])
+   431→            and float(cur["close"]) >= float(prev["open"])
+   432→        )
+   433→    elif pattern == "bearish_engulfing" and prev is not None:
+   434→        matched = (
+   435→            is_bull(prev)
+   436→            and is_bear(cur)
+   437→            and float(cur["open"]) >= float(prev["close"])
+   438→            and float(cur["close"]) <= float(prev["open"])
+   439→        )
+   440→    elif pattern == "hammer":
+   441→        lower_wick = min(float(cur["open"]), float(cur["close"])) - float(cur["low"])
+   442→        upper_wick = float(cur["high"]) - max(float(cur["open"]), float(cur["close"]))
+   443→        mid = (float(cur["high"]) + float(cur["low"])) / 2
+   444→        matched = (
+   445→            lower_wick >= 2 * body_cur
+   446→            and upper_wick <= body_cur
+   447→            and float(cur["close"]) >= mid
+   448→        )
+   449→        detail.update({"lower_wick": lower_wick, "upper_wick": upper_wick})
+   450→    elif pattern == "shooting_star":
+   451→        lower_wick = min(float(cur["open"]), float(cur["close"])) - float(cur["low"])
+   452→        upper_wick = float(cur["high"]) - max(float(cur["open"]), float(cur["close"]))
+   453→        mid = (float(cur["high"]) + float(cur["low"])) / 2
+   454→        matched = (
+   455→            upper_wick >= 2 * body_cur
+   456→            and lower_wick <= body_cur
+   457→            and float(cur["close"]) <= mid
+   458→        )
+   459→        detail.update({"lower_wick": lower_wick, "upper_wick": upper_wick})
+   460→    elif pattern == "doji":
+   461→        matched = body_cur <= max_body_ratio * rng
+   462→        detail.update({"body": body_cur, "range": rng, "max_body_ratio": max_body_ratio})
+   463→    elif pattern == "inside_bar" and prev is not None:
+   464→        matched = float(cur["high"]) <= float(prev["high"]) and float(cur["low"]) >= float(prev["low"])
+   465→        if prev is not None:
+   466→            detail.update(
+   467→                {
+   468→                    "previous_high": float(prev["high"]),
+   469→                    "previous_low": float(prev["low"]),
+   470→                }
+   471→            )
+   472→
+   473→    evidence.update(detail)
+   474→    evidence["matched_pattern"] = matched
+   475→    return _node(condition, description, evidence, matched)
+   476→
+   477→
+   478→# --------------------------------------------------------------------------- #
+   479→# swing points (shared by three rule types)
+   480→# --------------------------------------------------------------------------- #
+   481→
+   482→
+   483→def _confirmed_swings(
+   484→    window: list[dict[str, Any]], kind: str, strength: int
+   485→) -> list[dict[str, Any]]:
+   486→    """Swings confirmed strictly inside the supplied window (no look-ahead).
+   487→
+   488→    Thin delegate to the canonical feature library implementation
+   489→    (:func:`app.domains.analysis.features.confirmed_swings`) so rule
+   490→    evaluation and feature observations can never diverge. Entries carry
+   491→    ``index``/``time``/``price`` plus the explicit confirmation timing.
+   492→    """
+   493→
+   494→    return _feature_swings(window, kind, strength)
+   495→
+   496→
+   497→def evaluate_swing_point(
+   498→    condition: Condition, candles: list[dict[str, Any]]
+   499→) -> NodeResult:
+   500→    tf = condition.timeframe
+   501→    kind = str(condition.params["kind"])
+   502→    strength = int(condition.params["strength"])
+   503→    window = _window(candles, condition.lookback)
+   504→
+   505→    description = (
+   506→        f"confirmed swing {kind} (strength {strength}) within last "
+   507→        f"{len(window)} candle(s) on {tf}"
+   508→    )
+   509→    evidence: dict[str, Any] = {
+   510→        "condition_type": condition.type,
+   511→        "timeframe": tf,
+   512→        "kind": kind,
+   513→        "strength": strength,
+   514→        "lookback": condition.lookback,
+   515→        "candles_evaluated": len(window),
+   516→        "candles_available": len(candles),
+   517→        "criterion": (
+   518→            "a swing high/low confirmed by `strength` subsequent candles "
+   519→            "inside the window (no look-ahead)"
+   520→        ),
+   521→    }
+   522→    minimum = 2 * strength + 1
+   523→    if len(window) < minimum:
+   524→        return _unsatisfied(
+   525→            condition,
+   526→            description,
+   527→            evidence,
+   528→            reason=(
+   529→                f"Detecting strength-{strength} swings needs at least "
+   530→                f"{minimum} candles in the window."
+   531→            ),
+   532→        )
+   533→    swings = _confirmed_swings(window, kind, strength)
+   534→    evidence["swings_found"] = len(swings)
+   535→    evidence["swings"] = [
+   536→        {"time": s["time"], "price": s["price"]} for s in swings[-5:]
+   537→    ]
+   538→    return _node(condition, description, evidence, bool(swings))
+   539→
+   540→
+   541→# --------------------------------------------------------------------------- #
+   542→# structure_pattern (HH / HL / LH / LL)
+   543→# --------------------------------------------------------------------------- #
+   544→
+   545→
+   546→def evaluate_structure_pattern(
+   547→    condition: Condition, candles: list[dict[str, Any]]
+   548→) -> NodeResult:
+   549→    tf = condition.timeframe
+   550→    pattern = str(condition.params["pattern"])
+   551→    count = int(condition.params["count"])
+   552→    strength = int(condition.params.get("strength", 2))
+   553→    window = _window(candles, condition.lookback)
+   554→
+   555→    kind = "high" if pattern in ("higher_highs", "lower_highs") else "low"
+   556→    rising = pattern in ("higher_highs", "higher_lows")
+   557→    description = (
+   558→        f"{pattern.replace('_', ' ')}: last {count} confirmed swing {kind}s "
+   559→        f"{'strictly rising' if rising else 'strictly falling'} on {tf}"
+   560→    )
+   561→    evidence: dict[str, Any] = {
+   562→        "condition_type": condition.type,
+   563→        "timeframe": tf,
+   564→        "pattern": pattern,
+   565→        "count": count,
+   566→        "strength": strength,
+   567→        "candles_evaluated": len(window),
+   568→        "candles_available": len(candles),
+   569→        "criterion": (
+   570→            f"the most recent {count} confirmed swing {kind}s must be "
+   571→            f"{'strictly rising' if rising else 'strictly falling'}"
+   572→        ),
+   573→    }
+   574→    minimum = 2 * strength + count
+   575→    if len(window) < minimum:
+   576→        return _unsatisfied(
+   577→            condition,
+   578→            description,
+   579→            evidence,
+   580→            reason=(
+   581→                f"Confirming {count} strength-{strength} swings needs at "
+   582→                f"least {minimum} candles in the window."
+   583→            ),
+   584→        )
+   585→    swings = _confirmed_swings(window, kind, strength)[-count:]
+   586→    evidence["swings_found"] = len(swings)
+   587→    evidence["swing_prices"] = [s["price"] for s in swings]
+   588→    if len(swings) < count:
+   589→        evidence["reason"] = (
+   590→            f"Only {len(swings)} confirmed swing {kind}(s) in the window; "
+   591→            f"{count} are required."
+   592→        )
+   593→        return _node(condition, description, evidence, False)
+   594→    if rising:
+   595→        satisfied = all(
+   596→            swings[i]["price"] > swings[i - 1]["price"] for i in range(1, len(swings))
+   597→        )
+   598→    else:
+   599→        satisfied = all(
+   600→            swings[i]["price"] < swings[i - 1]["price"] for i in range(1, len(swings))
+   601→        )
+   602→    return _node(condition, description, evidence, satisfied)
+   603→
+   604→
+   605→# --------------------------------------------------------------------------- #
+   606→# market_structure_break (generic BOS)
+   607→# --------------------------------------------------------------------------- #
+   608→
+   609→
+   610→def evaluate_market_structure_break(
+   611→    condition: Condition, candles: list[dict[str, Any]]
+   612→) -> NodeResult:
+   613→    tf = condition.timeframe
+   614→    side = str(condition.params["side"])
+   615→    strength = int(condition.params.get("strength", 2))
+   616→    window = _window(candles, condition.lookback)
+   617→
+   618→    swing_kind = "high" if side == "bullish" else "low"
+   619→    description = (
+   620→        f"{side} structure break: close beyond the most recent confirmed "
+   621→        f"swing {swing_kind} (strength {strength}) on {tf}"
+   622→    )
+   623→    evidence: dict[str, Any] = {
+   624→        "condition_type": condition.type,
+   625→        "timeframe": tf,
+   626→        "side": side,
+   627→        "strength": strength,
+   628→        "candles_evaluated": len(window),
+   629→        "candles_available": len(candles),
+   630→        "criterion": (
+   631→            f"latest close must be {'above' if side == 'bullish' else 'below'} "
+   632→            f"the most recent confirmed swing {swing_kind} in the window"
+   633→        ),
+   634→    }
+   635→    if len(window) < 2 * strength + 2:
+   636→        return _unsatisfied(
+   637→            condition,
+   638→            description,
+   639→            evidence,
+   640→            reason=(
+   641→                f"A break evaluation needs at least {2 * strength + 2} "
+   642→                "candles (swing + the breaking candle)."
+   643→            ),
+   644→        )
+   645→
+   646→    # Swings confirmed strictly BEFORE the latest candle: the last
+   647→    # `strength` candles cannot be confirmed swings, and the breaking
+   648→    # candle itself is the latest one.
+   649→    swing_zone = window[:-1]
+   650→    swings = _confirmed_swings(swing_zone, swing_kind, strength)
+   651→    evidence["reference_swings"] = [
+   652→        {"time": s["time"], "price": s["price"]} for s in swings[-3:]
+   653→    ]
+   654→    if not swings:
+   655→        return _unsatisfied(
+   656→            condition,
+   657→            description,
+   658→            evidence,
+   659→            reason=f"No confirmed swing {swing_kind} available as the break reference.",
+   660→        )
+   661→    reference = swings[-1]
+   662→    close = float(window[-1]["close"])
+   663→    satisfied = close > reference["price"] if side == "bullish" else close < reference["price"]
+   664→    evidence.update(
+   665→        {
+   666→            "reference_swing_price": reference["price"],
+   667→            "reference_swing_time": reference["time"],
+   668→            "current_close": close,
+   669→        }
+   670→    )
+   671→    return _node(condition, description, evidence, satisfied)
+   672→
+   673→
+   674→# --------------------------------------------------------------------------- #
+   675→# moving_average
+   676→# --------------------------------------------------------------------------- #
+   677→
+   678→
+   679→def _sma(series: list[float], period: int) -> list[float] | None:
+   680→    if len(series) < period:
+   681→        return None
+   682→    out = [math.nan] * len(series)
+   683→    running = sum(series[:period])
+   684→    out[period - 1] = running / period
+   685→    for i in range(period, len(series)):
+   686→        running += series[i] - series[i - period]
+   687→        out[i] = running / period
+   688→    return out
+   689→
+   690→
+   691→def _ema(series: list[float], period: int) -> list[float] | None:
+   692→    if len(series) < period:
+   693→        return None
+   694→    out = [math.nan] * len(series)
+   695→    alpha = 2.0 / (period + 1)
+   696→    prev = sum(series[:period]) / period  # SMA seed (documented)
+   697→    out[period - 1] = prev
+   698→    for i in range(period, len(series)):
+   699→        prev = alpha * series[i] + (1 - alpha) * prev
+   700→        out[i] = prev
+   701→    return out
+   702→
+   703→
+   704→def evaluate_moving_average(
+   705→    condition: Condition, candles: list[dict[str, Any]]
+   706→) -> NodeResult:
+   707→    tf = condition.timeframe
+   708→    ma_type = str(condition.params["ma_type"])
+   709→    period = int(condition.params["period"])
+   710→    source = str(condition.params.get("source", "close"))
+   711→    compare_to = str(condition.params["compare_to"])
+   712→    operator = str(condition.params["operator"])
+   713→    window = _window(candles, condition.lookback)
+   714→
+   715→    needs_two = operator in ("crosses_above", "crosses_below")
+   716→    target_desc = (
+   717→        f"{float(condition.params['value']):g}"
+   718→        if compare_to == "value" and "value" in condition.params
+   719→        else str(condition.params.get("price_field", "price field"))
+   720→    )
+   721→    description = (
+   722→        f"{ma_type.upper()}({period}) of {source} {operator.replace('_', ' ')} "
+   723→        f"{target_desc} on {tf} (last {len(window)} candle(s))"
+   724→    )
+   725→    evidence: dict[str, Any] = {
+   726→        "condition_type": condition.type,
+   727→        "timeframe": tf,
+   728→        "ma_type": ma_type,
+   729→        "period": period,
+   730→        "source": source,
+   731→        "compare_to": compare_to,
+   732→        "operator": operator,
+   733→        "lookback": condition.lookback,
+   734→        "candles_evaluated": len(window),
+   735→        "candles_available": len(candles),
+   736→    }
+   737→
+   738→    if not window or (needs_two and len(window) < 2):
+   739→        return _unsatisfied(
+   740→            condition,
+   741→            description,
+   742→            evidence,
+   743→            reason="Cross conditions need at least 2 candles in the window.",
+   744→        )
+   745→    series = _series_from(window, source)
+   746→    ma_series = (_ema if ma_type == "ema" else _sma)(series, period)
+   747→    if ma_series is None or math.isnan(ma_series[-1]) or (
+   748→        needs_two and math.isnan(ma_series[-2])
+   749→    ):
+   750→        return _unsatisfied(
+   751→            condition,
+   752→            description,
+   753→            evidence,
+   754→            reason=(
+   755→                f"{ma_type.upper()}({period}) needs at least {period} "
+   756→                "candles in the window."
+   757→            ),
+   758→        )
+   759→
+   760→    if compare_to == "value":
+   761→        threshold = float(condition.params["value"])
+   762→        target_series = [threshold] * len(series)
+   763→        evidence["threshold"] = threshold
+   764→        target_label = f"{threshold:g}"
+   765→    else:
+   766→        target_field = str(condition.params["price_field"])
+   767→        target_series = _series_from(window, target_field)
+   768→        evidence["price_field"] = target_field
+   769→        target_label = target_field
+   770→
+   771→    description = (
+   772→        f"{ma_type.upper()}({period}) of {source} "
+   773→        f"{operator.replace('_', ' ')} {target_label} on {tf} "
+   774→        f"(last {len(window)} candle(s))"
+   775→    )
+   776→
+   777→    if operator in ("above", "below"):
+   778→        last_ma = ma_series[-1]
+   779→        satisfied = last_ma > target_series[-1] if operator == "above" else last_ma < target_series[-1]
+   780→        evidence.update(
+   781→            {
+   782→                "ma_value": last_ma,
+   783→                "target_value": target_series[-1],
+   784→                "criterion": "MA on the latest candle must satisfy the comparison",
+   785→            }
+   786→        )
+   787→    else:
+   788→        # Compare the MA against the target series at aligned indices; skip
+   789→        # the MA warm-up (NaN) region — the first valid MA value sits at
+   790→        # index period-1 (the SMA/EMA seed).
+   791→        start = period - 1
+   792→        ma_valid = ma_series[start:]
+   793→        target_valid = target_series[start:]
+   794→        satisfied, crosses = _crossover_satisfied(operator, ma_valid, target_valid)
+   795→        evidence.update(
+   796→            {
+   797→                "ma_value": ma_series[-1],
+   798→                "previous_ma_value": ma_series[-2],
+   799→                "target_value": target_series[-1],
+   800→                "previous_target_value": target_series[-2],
+   801→                "crosses_in_window": [
+   802→                    {"time": window[start + i]["time"], "value": ma_valid[i]}
+   803→                    for i in crosses[-10:]
+   804→                ],
+   805→                "total_crosses_in_window": len(crosses),
+   806→                "criterion": "latest candle must complete the cross",
+   807→            }
+   808→        )
+   809→    return _node(condition, description, evidence, satisfied)
+   810→
+   811→
+   812→# --------------------------------------------------------------------------- #
+   813→# price_zone
+   814→# --------------------------------------------------------------------------- #
+   815→
+   816→
+   817→def evaluate_price_zone(
+   818→    condition: Condition, candles: list[dict[str, Any]]
+   819→) -> NodeResult:
+   820→    tf = condition.timeframe
+   821→    zone_low = float(condition.params["zone_low"])
+   822→    zone_high = float(condition.params["zone_high"])
+   823→    operator = str(condition.params["operator"])
+   824→    window = _window(candles, condition.lookback)
+   825→
+   826→    description = (
+   827→        f"zone [{zone_low:g}, {zone_high:g}] {operator.replace('_', ' ')} "
+   828→        f"on {tf} (last {len(window)} candle(s))"
+   829→    )
+   830→    evidence: dict[str, Any] = {
+   831→        "condition_type": condition.type,
+   832→        "timeframe": tf,
+   833→        "zone_low": zone_low,
+   834→        "zone_high": zone_high,
+   835→        "operator": operator,
+   836→        "lookback": condition.lookback,
+   837→        "candles_evaluated": len(window),
+   838→        "candles_available": len(candles),
+   839→    }
+   840→    if not window:
+   841→        return _unsatisfied(
+   842→            condition, description, evidence, "No usable candles for this timeframe."
+   843→        )
+   844→
+   845→    def touches(c: dict[str, Any]) -> bool:
+   846→        return float(c["low"]) <= zone_high and float(c["high"]) >= zone_low
+   847→
+   848→    if operator == "touched":
+   849→        hits = [c for c in window if touches(c)]
+   850→        evidence.update(
+   851→            {
+   852→                "touches": len(hits),
+   853→                "first_touch_time": hits[0]["time"] if hits else None,
+   854→                "last_touch_time": hits[-1]["time"] if hits else None,
+   855→                "criterion": "any candle in the window overlaps the zone",
+   856→            }
+   857→        )
+   858→        return _node(condition, description, evidence, bool(hits))
+   859→
+   860→    latest = window[-1]
+   861→    close = float(latest["close"])
+   862→    if operator == "closed_inside":
+   863→        satisfied = zone_low <= close <= zone_high
+   864→        evidence.update(
+   865→            {
+   866→                "current_close": close,
+   867→                "criterion": "latest candle's close lies inside the zone (inclusive)",
+   868→            }
+   869→        )
+   870→        return _node(condition, description, evidence, satisfied)
+   871→
+   872→    # rejected: latest candle touched the zone intrabar but closed outside.
+   873→    touched = touches(latest)
+   874→    closed_inside = zone_low <= close <= zone_high
+   875→    satisfied = touched and not closed_inside
+   876→    evidence.update(
+   877→        {
+   878→            "current_close": close,
+   879→            "touched_zone": touched,
+   880→            "criterion": "latest candle touched the zone but closed outside it",
+   881→        }
+   882→    )
+   883→    return _node(condition, description, evidence, satisfied)
+   884→
+   885→
+   886→# --------------------------------------------------------------------------- #
+   887→# Dispatch registry: condition type -> evaluator. The registry (rule_registry)
+   888→# and this mapping must stay in sync; unit tests enforce that every
+   889→# "available" type has exactly one evaluator.
+   890→# --------------------------------------------------------------------------- #
+   891→
+   892→CONDITION_EVALUATORS = {
+   893→    "price_level": evaluate_price_level_condition,
+   894→    "candle_property": evaluate_candle_property,
+   895→    "candle_pattern": evaluate_candle_pattern,
+   896→    "swing_point": evaluate_swing_point,
+   897→    "structure_pattern": evaluate_structure_pattern,
+   898→    "market_structure_break": evaluate_market_structure_break,
+   899→    "moving_average": evaluate_moving_average,
+   900→    "price_zone": evaluate_price_zone,
+   901→}
+   902→
+   903→# Phase 4 advanced rule implementations (rules_advanced.py). Registered
+   904→# AFTER this module's own evaluators; rules_advanced imports this module,
+   905→# so the wiring happens here at the end of the module (no import cycle).
+   906→from app.domains.analysis import rules_advanced as _advanced  # noqa: E402
+   907→
+   908→CONDITION_EVALUATORS.update(
+   909→    {
+   910→        "mss_choch": _advanced.evaluate_mss_choch,
+   911→        "bos": _advanced.evaluate_bos,
+   912→        "liquidity_sweep": _advanced.evaluate_liquidity_sweep,
+   913→        "fvg": _advanced.evaluate_fvg,
+   914→    }
+   915→)
+   916→
+   917→
+   918→def _minimum_candles(condition: Condition) -> int:
+   919→    """Worst-case minimum window size implied by the condition's type."""
+   920→
+   921→    p = condition.params
+   922→    t = condition.type
+   923→    if t == "moving_average":
+   924→        return int(p.get("period", 2)) + (2 if str(p.get("operator", "")).startswith("crosses") else 1)
+   925→    if t in ("swing_point",):
+   926→        return 2 * int(p.get("strength", 1)) + 1
+   927→    if t in ("structure_pattern",):
+   928→        return 2 * int(p.get("strength", 2)) + int(p.get("count", 2))
+   929→    if t in ("market_structure_break", "mss_choch", "bos"):
+   930→        # Two swing contexts per kind + the breaking candle.
+   931→        return 2 * int(p.get("strength", 2)) + 3
+   932→    if t == "liquidity_sweep":
+   933→        return 2 * int(p.get("strength", 2)) + 2
+   934→    if t == "fvg":
+   935→        return 3
+   936→    if t == "candle_pattern":
+   937→        return 2
+   938→    return 1
+   939→
+   940→
+   941→# --------------------------------------------------------------------------- #
+   942→# Group + rule set evaluation
+   943→# --------------------------------------------------------------------------- #
+   944→
+   945→
+   946→def _candle_status(candles: list[dict[str, Any]]) -> dict[str, Any]:
+   947→    """Candle-basis evidence for one condition's timeframe."""
+   948→
+   949→    if not candles:
+   950→        return {"last_candle_time": None, "last_candle_status": "no_data"}
+   951→    last = candles[-1]
+   952→    forming = last.get("forming") is True
+   953→    return {
+   954→        "last_candle_time": last.get("time"),
+   955→        "last_candle_status": "forming" if forming else "closed",
+   956→        "forming_candle_used": forming,
+   957→    }
+   958→
+   959→
+   960→def _group_status(logic: str, children: list[NodeResult]) -> tuple[str, str | None]:
+   961→    """Four-state group semantics (documented in the module docstring).
+   962→
+   963→    Returns ``(status, reason)``. Unknown/unsupported children never
+   964→    become success; OR never conceals unavailable children.
+   965→    """
+   966→
+   967→    required = [c for c in children if not c.optional]
+   968→    statuses = [c.status for c in required]
+   969→    optional_unmet = sum(1 for c in children if c.optional and c.status != STATUS_MET)
+   970→
+   971→    if logic == "AND":
+   972→        if any(s == STATUS_UNSUPPORTED for s in statuses):
+   973→            return STATUS_UNSUPPORTED, (
+   974→                "AND group cannot be fully evaluated: a required rule type "
+   975→                "has no evaluator. Unknown rules are never treated as met."
+   976→            )
+   977→        if any(s == STATUS_NOT_MET for s in statuses):
+   978→            return STATUS_NOT_MET, (
+   979→                "At least one required rule was evaluated and is not met."
+   980→            )
+   981→        if any(s == STATUS_INCONCLUSIVE for s in statuses):
+   982→            return STATUS_INCONCLUSIVE, (
+   983→                "At least one required rule could not be evaluated from the "
+   984→                "supplied data — AND groups never assume unknown rules hold."
+   985→            )
+   986→        if not required:
+   987→            return STATUS_INCONCLUSIVE, (
+   988→                "The group contains no required rules (misconfigured?)."
+   989→            )
+   990→        return STATUS_MET, "Every required rule is met."
+   991→
+   992→    # OR semantics (Phase 3 compatibility preserved: a met OPTIONAL child
+   993→    # may satisfy the group; unavailable REQUIRED children still surface).
+   994→    if any(c.status == STATUS_MET for c in children):
+   995→        return STATUS_MET, "At least one rule (required or optional) is met."
+   996→    statuses = [c.status for c in required]
+   997→    if not required:
+   998→        # Only optional children: report unavailability honestly.
+   999→        if any(c.status == STATUS_UNSUPPORTED for c in children):
+  1000→            return STATUS_UNSUPPORTED, (
+  1001→                "No rule is met and the group only contains optional rules, "
+  1002→                "one of which cannot be evaluated (unsupported type)."
+  1003→            )
+  1004→        if any(c.status == STATUS_INCONCLUSIVE for c in children):
+  1005→            return STATUS_INCONCLUSIVE, (
+  1006→                "No rule is met and the group only contains optional rules, "
+  1007→                "one of which could not be evaluated from the supplied data."
+  1008→            )
+  1009→        return STATUS_NOT_MET, "No rule (required or optional) is met."
+  1010→    if any(s == STATUS_UNSUPPORTED for s in statuses):
+  1011→        return STATUS_UNSUPPORTED, (
+  1012→            "No required rule is met and at least one cannot be evaluated "
+  1013→            "(unsupported type). Unavailable rules are reported, never "
+  1014→            "concealed."
+  1015→        )
+  1016→    if any(s == STATUS_INCONCLUSIVE for s in statuses):
+  1017→        return STATUS_INCONCLUSIVE, (
+  1018→            "No required rule is met and at least one could not be "
+  1019→            "evaluated from the supplied data."
+  1020→        )
+  1021→    return STATUS_NOT_MET, "Every required rule was evaluated and none is met."
+  1022→
+  1023→
+  1024→def evaluate_group(
+  1025→    group: Group, candles_by_timeframe: dict[str, list[dict[str, Any]]]
+  1026→) -> NodeResult:
+  1027→    children: list[NodeResult] = []
+  1028→    for cond in group.conditions:
+  1029→        candles = candles_by_timeframe.get(cond.timeframe, [])
+  1030→        evaluator = CONDITION_EVALUATORS.get(cond.type)
+  1031→        if evaluator is None:
+  1032→            # Defensive: validation already rejects unknown/unavailable
+  1033→            # types. If one ever reaches the evaluator, fail CLOSED with an
+  1034→            # explicit reason instead of pretending it was checked.
+  1035→            children.append(
+  1036→                NodeResult(
+  1037→                    kind="condition",
+  1038→                    id=cond.id,
+  1039→                    logic=None,
+  1040→                    status=STATUS_UNSUPPORTED,
+  1041→                    description=f"{cond.type} on {cond.timeframe}",
+  1042→                    evidence={
+  1043→                        "condition_type": cond.type,
+  1044→                        "reason": (
+  1045→                            "No evaluator registered for this rule type. "
+  1046→                            "The platform does not pretend unsupported rules "
+  1047→                            "are satisfied."
+  1048→                        ),
+  1049→                    },
+  1050→                    optional=cond.optional,
+  1051→                )
+  1052→            )
+  1053→            continue
+  1054→        node = evaluator(cond, candles)
+  1055→        node.evidence.update(_candle_status(candles))
+  1056→        children.append(node)
+  1057→    for nested in group.groups:
+  1058→        children.append(evaluate_group(nested, candles_by_timeframe))
+  1059→
+  1060→    status, reason = _group_status(group.logic, children)
+  1061→    suffix = (
+  1062→        f" ({sum(1 for c in children if c.optional and c.status != STATUS_MET)} "
+  1063→        "optional rule(s) currently unmet)"
+  1064→        if any(c.optional and c.status != STATUS_MET for c in children)
+  1065→        else ""
+  1066→    )
+  1067→    return NodeResult(
+  1068→        kind="group",
+  1069→        id=f"group_{group.logic.lower()}_{id(group) % 100000:05d}",
+  1070→        logic=group.logic,
+  1071→        status=status,
+  1072→        description=(
+  1073→            f"ALL of {len(children)} condition(s)/group(s) must hold{suffix}"
+  1074→            if group.logic == "AND"
+  1075→            else f"AT LEAST ONE of {len(children)} condition(s)/group(s) must hold"
+  1076→        ),
+  1077→        evidence={"status_reason": reason} if reason else {},
+  1078→        children=children,
+  1079→    )
+  1080→
+  1081→
+  1082→def collect_timeframes(group: Group | None, into: set[str]) -> None:
+  1083→    if group is None:
+  1084→        return
+  1085→    for cond in group.conditions:
+  1086→        into.add(cond.timeframe)
+  1087→    for nested in group.groups:
+  1088→        collect_timeframes(nested, into)
+  1089→
+  1090→
+  1091→def evaluate_rule_set(
+  1092→    rule_set: RuleSet,
+  1093→    candles_by_timeframe: dict[str, list[dict[str, Any]]],
+  1094→    *,
+  1095→    regime_check: dict[str, Any] | None = None,
+  1096→) -> EvaluationResult:
+  1097→    """Evaluate a validated rule set against caller-supplied candles.
+  1098→
+  1099→    ``regime_check`` (optional) is the output of
+  1100→    :func:`app.domains.analysis.regime.regime_applicability`. When it is
+  1101→    supplied and ``applicable`` is False, the setup is NEVER reported as
+  1102→    fully satisfied — ``setup_status`` becomes ``regime_mismatch`` (an
+  1103→    unknown regime can never satisfy a strategy regime requirement).
+  1104→    """
+  1105→
+  1106→    from datetime import datetime, timezone
+  1107→
+  1108→    evaluated_at = datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds")
+  1109→    warnings: list[dict[str, Any]] = []
+  1110→    used_timeframes: set[str] = set()
+  1111→    collect_timeframes(rule_set.conditions, used_timeframes)
+  1112→    collect_timeframes(rule_set.confirmation, used_timeframes)
+  1113→    collect_timeframes(rule_set.invalidation, used_timeframes)
+  1114→
+  1115→    # Closed-candle policy (Phase 4): forming candles are excluded by
+  1116→    # default for confirmed candle-based conditions; explicit opt-in is
+  1117→    # labelled provisional.
+  1118→    on_close_only = bool(rule_set.evaluation.get("on_close_only", True))
+  1119→    forming_used = False
+  1120→
+  1121→    # Normalise + assess every referenced timeframe; keep usable series only.
+  1122→    usable: dict[str, list[dict[str, Any]]] = {}
+  1123→    missing_timeframes: list[str] = []
+  1124→    for tf in sorted(used_timeframes):
+  1125→        raw = candles_by_timeframe.get(tf)
+  1126→        if not raw:
+  1127→            missing_timeframes.append(tf)
+  1128→            continue
+  1129→        series_warnings, rows = assess_candle_series(
+  1130→            raw, tf, _required_count_for_timeframe(rule_set, tf)
+  1131→        )
+  1132→        warnings.extend(series_warnings)
+  1133→        # Drop candles with invalid OHLC from evaluation (warned above).
+  1134→        clean = [row for row in rows if _row_valid(row)]
+  1135→        if clean and clean[-1].get("forming") is True:
+  1136→            if on_close_only:
+  1137→                warnings.append(
+  1138→                    {
+  1139→                        "code": "FORMING_CANDLE_EXCLUDED",
+  1140→                        "timeframe": tf,
+  1141→                        "message": (
+  1142→                            "The forming (not yet closed) candle was excluded "
+  1143→                            "from evaluation (closed-candles-only policy)."
+  1144→                        ),
+  1145→                    }
+  1146→                )
+  1147→                clean = [row for row in clean if row.get("forming") is not True]
+  1148→            else:
+  1149→                forming_used = True
+  1150→                warnings.append(
+  1151→                    {
+  1152→                        "code": "PROVISIONAL_FORMING_CANDLE",
+  1153→                        "timeframe": tf,
+  1154→                        "message": (
+  1155→                            "The forming candle was INCLUDED at the user's "
+  1156→                            "request. Results are provisional and may change "
+  1157→                            "before the candle closes."
+  1158→                        ),
+  1159→                    }
+  1160→                )
+  1161→        if clean:
+  1162→            usable[tf] = clean
+  1163→        elif rows:
+  1164→            missing_timeframes.append(tf)
+  1165→
+  1166→    if missing_timeframes:
+  1167→        core = NodeResult(
+  1168→            kind="group",
+  1169→            id="group_core",
+  1170→            logic="AND",
+  1171→            status=STATUS_INCONCLUSIVE,
+  1172→            description="Not evaluated: required candle data is missing.",
+  1173→            evidence={
+  1174→                "missing_timeframes": missing_timeframes,
+  1175→                "reason": "The request did not include usable candles for "
+  1176→                "every timeframe referenced by the rule set. The platform "
+  1177→                "does not fabricate market data.",
+  1178→            },
+  1179→        )
+  1180→        return EvaluationResult(
+  1181→            direction=rule_set.direction,
+  1182→            setup_status="insufficient_data",
+  1183→            core=core,
+  1184→            confirmation=None,
+  1185→            invalidation=None,
+  1186→            warnings=warnings,
+  1187→            summary=[
+  1188→                f"Missing candle data for timeframe(s): {', '.join(missing_timeframes)}.",
+  1189→                "Provide candles for all referenced timeframes to obtain a "
+  1190→                "full evaluation.",
+  1191→            ],
+  1192→            evaluated_at=evaluated_at,
+  1193→            core_status=core.status,
+  1194→            conditions_summary=_status_counts(None),
+  1195→            closed_candles_only=on_close_only,
+  1196→            forming_candle_used=forming_used,
+  1197→        )
+  1198→
+  1199→    core_result = evaluate_group(rule_set.conditions, usable)
+  1200→    confirmation_result = (
+  1201→        evaluate_group(rule_set.confirmation, usable)
+  1202→        if rule_set.confirmation is not None
+  1203→        else None
+  1204→    )
+  1205→    invalidation_result = (
+  1206→        evaluate_group(rule_set.invalidation, usable)
+  1207→        if rule_set.invalidation is not None
+  1208→        else None
+  1209→    )
+  1210→
+  1211→    if invalidation_result is not None and invalidation_result.status == STATUS_MET:
+  1212→        setup_status = "invalidated"
+  1213→    elif regime_check is not None and not regime_check.get("applicable", True):
+  1214→        setup_status = "regime_mismatch"
+  1215→    elif (
+  1216→        core_result.status == STATUS_MET
+  1217→        and (confirmation_result is None or confirmation_result.status == STATUS_MET)
+  1218→    ):
+  1219→        setup_status = "conditions_met"
+  1220→    elif STATUS_NOT_MET in (core_result.status, confirmation_result.status if confirmation_result else None):
+  1221→        setup_status = "conditions_missing"
+  1222→    else:
+  1223→        # Core/confirmation inconclusive or unsupported: never pretend a
+  1224→        # result. This is distinct from conditions_missing.
+  1225→        setup_status = "inconclusive"
+  1226→
+  1227→    summary = _build_summary(
+  1228→        rule_set,
+  1229→        setup_status,
+  1230→        core_result,
+  1231→        confirmation_result,
+  1232→        invalidation_result,
+  1233→    )
+  1234→    if forming_used:
+  1235→        summary.append(
+  1236→            "PROVISIONAL: a forming candle was included in the evaluation; "
+  1237→            "results may change before it closes."
+  1238→        )
+  1239→    if regime_check is not None:
+  1240→        summary.append(
+  1241→            f"Market regime: classified '{regime_check.get('classified')}' "
+  1242→            f"(strategy requires '{regime_check.get('required')}') — "
+  1243→            + (
+  1244→                "applicable."
+  1245→                if regime_check.get("applicable")
+  1246→                else "NOT applicable."
+  1247→            )
+  1248→        )
+  1249→
+  1250→    counts = _status_counts(core_result)
+  1251→    if confirmation_result is not None:
+  1252→        conf_counts = _status_counts(confirmation_result)
+  1253→        counts = {k: counts[k] + conf_counts[k] for k in counts}
+  1254→
+  1255→    return EvaluationResult(
+  1256→        direction=rule_set.direction,
+  1257→        setup_status=setup_status,
+  1258→        core=core_result,
+  1259→        confirmation=confirmation_result,
+  1260→        invalidation=invalidation_result,
+  1261→        warnings=warnings,
+  1262→        summary=summary,
+  1263→        evaluated_at=datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds"),
+  1264→        core_status=core_result.status,
+  1265→        confirmation_status=(
+  1266→            confirmation_result.status if confirmation_result is not None else None
+  1267→        ),
+  1268→        invalidation_status=(
+  1269→            invalidation_result.status if invalidation_result is not None else None
+  1270→        ),
+  1271→        conditions_summary=counts,
+  1272→        closed_candles_only=on_close_only,
+  1273→        forming_candle_used=forming_used,
+  1274→    )
+  1275→
+  1276→
+  1277→def _status_counts(node: NodeResult | None) -> dict[str, int]:
+  1278→    """Count CONDITIONS (not groups) by status across a subtree."""
+  1279→
+  1280→    counts = {STATUS_MET: 0, STATUS_NOT_MET: 0, STATUS_INCONCLUSIVE: 0, STATUS_UNSUPPORTED: 0}
+  1281→    if node is None:
+  1282→        return counts
+  1283→
+  1284→    def walk(n: NodeResult) -> None:
+  1285→        if n.kind == "condition":
+  1286→            counts[n.status] = counts.get(n.status, 0) + 1
+  1287→            return
+  1288→        for child in n.children:
+  1289→            walk(child)
+  1290→
+  1291→    walk(node)
+  1292→    return counts
+  1293→
+  1294→
+  1295→def _required_count(group: Group) -> int:
+  1296→    """Worst-case candles needed by any condition in the tree."""
+  1297→
+  1298→    needed = 1
+  1299→    for cond in group.conditions:
+  1300→        needed = max(needed, cond.lookback, _minimum_candles(cond))
+  1301→    for nested in group.groups:
+  1302→        needed = max(needed, _required_count(nested))
+  1303→    return needed
+  1304→
+  1305→
+  1306→def _required_count_for_timeframe(rule_set: RuleSet, timeframe: str) -> int:
+  1307→    required = 1
+  1308→
+  1309→    def scan(group: Group | None) -> None:
+  1310→        nonlocal required
+  1311→        if group is None:
+  1312→            return
+  1313→        for cond in group.conditions:
+  1314→            if cond.timeframe != timeframe:
+  1315→                continue
+  1316→            required = max(required, cond.lookback, _minimum_candles(cond))
+  1317→        for nested in group.groups:
+  1318→            scan(nested)
+  1319→
+  1320→    scan(rule_set.conditions)
+  1321→    scan(rule_set.confirmation)
+  1322→    scan(rule_set.invalidation)
+  1323→    return required
+  1324→
+  1325→
+  1326→def _row_valid(row: dict[str, Any]) -> bool:
+  1327→    values = [row.get(k) for k in ("open", "high", "low", "close")]
+  1328→    if any(
+  1329→        v is None or isinstance(v, bool) or not isinstance(v, (int, float))
+  1330→        or not math.isfinite(float(v)) or float(v) <= 0
+  1331→        for v in values
+  1332→    ):
+  1333→        return False
+  1334→    o, h, l, c = (float(v) for v in values)
+  1335→    return h >= l and h >= o and h >= c and l <= o and l <= c
+  1336→
+  1337→
+  1338→def _build_summary(
+  1339→    rule_set: RuleSet,
+  1340→    status: str,
+  1341→    core: NodeResult,
+  1342→    confirmation: NodeResult | None,
+  1343→    invalidation: NodeResult | None,
+  1344→) -> list[str]:
+  1345→    lines: list[str] = []
+  1346→    direction_label = {
+  1347→        "bullish": "BULLISH (look for long setups)",
+  1348→        "bearish": "BEARISH (look for short setups)",
+  1349→        "both": "BOTH DIRECTIONS (long and short setups)",
+  1350→    }[rule_set.direction]
+  1351→    lines.append(f"Strategy direction: {direction_label}.")
+  1352→    if status == "invalidated":
+  1353→        lines.append(
+  1354→            "The invalidation rules are currently satisfied — the setup is "
+  1355→            "considered invalid regardless of the core conditions."
+  1356→        )
+  1357→    elif status == "regime_mismatch":
+  1358→        lines.append(
+  1359→            "The strategy's market-regime requirement is not satisfied by "
+  1360→            "the classified regime — the setup is not evaluated as fully "
+  1361→            "satisfied."
+  1362→        )
+  1363→    elif status == "conditions_met":
+  1364→        extra = " and all confirmation rules" if confirmation is not None else ""
+  1365→        lines.append(f"Core conditions{extra} are met on the provided data.")
+  1366→    elif status == "conditions_missing":
+  1367→        failed = _count_failed(core) + (_count_failed(confirmation) if confirmation else 0)
+  1368→        optional_unmet = _count_optional_unmet(core) + (
+  1369→            _count_optional_unmet(confirmation) if confirmation else 0
+  1370→        )
+  1371→        if failed:
+  1372→            lines.append(
+  1373→                f"{failed} required condition(s)/group(s) are not satisfied "
+  1374→                "yet — the setup is not confirmed by the current data."
+  1375→            )
+  1376→        if optional_unmet:
+  1377→            lines.append(
+  1378→                f"{optional_unmet} optional rule(s) are unmet (they do not "
+  1379→                "block the setup)."
+  1380→            )
+  1381→    elif status == "inconclusive":
+  1382→        lines.append(
+  1383→            "One or more required conditions could not be evaluated from "
+  1384→            "the supplied data (insufficient history or unsupported rule "
+  1385→            "type) — no setup conclusion is possible. Unknown conditions "
+  1386→            "are never treated as satisfied."
+  1387→        )
+  1388→    lines.append(
+  1389→        f"Evaluated {rule_set.mode.replace('_', ' ')} rule set v"
+  1390→        f"{rule_set.schema_version} on timeframes: "
+  1391→        f"{', '.join(rule_set.timeframes)}."
+  1392→    )
+  1393→    if invalidation is not None and not invalidation.satisfied:
+  1394→        lines.append("Invalidation rules are NOT triggered (good for this setup).")
+  1395→    return lines
+  1396→
+  1397→
+  1398→def _count_failed(node: NodeResult | None) -> int:
+  1399→    """Count unsatisfied REQUIRED conditions/groups (optional excluded)."""
+  1400→
+  1401→    if node is None:
+  1402→        return 0
+  1403→    if node.optional and not node.satisfied:
+  1404→        return 0
+  1405→    if node.kind == "condition":
+  1406→        return 0 if node.satisfied else 1
+  1407→    return sum(_count_failed(child) for child in node.children)
+  1408→
+  1409→
+  1410→def _count_optional_unmet(node: NodeResult | None) -> int:
+  1411→    if node is None:
+  1412→        return 0
+  1413→    if node.kind == "condition":
+  1414→        return 1 if (node.optional and not node.satisfied) else 0
+  1415→    return sum(_count_optional_unmet(child) for child in node.children)
+  1416→

@@ -1,0 +1,11 @@
+# Optional MetaTrader 5 integration (Phase 2)
+#
+# The official MetaTrader5 package only installs on Windows (or Wine with
+# Windows Python). Install manually on the Windows host running the terminal:
+#
+#   pip install -r requirements-mt5.txt
+#
+# On every other platform the backend boots fine WITHOUT this file: the
+# adapter imports the package lazily and reports "package not installed"
+# honestly via /api/v1/mt5/status.
+MetaTrader5>=5.0.45; sys_platform == 'win32'
