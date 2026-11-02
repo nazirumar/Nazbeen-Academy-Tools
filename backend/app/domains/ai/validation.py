@@ -162,10 +162,22 @@ def _context_refs(context: AIContext | list[AIContext]) -> set[str]:
     for ctx in _contexts(context):
         if hasattr(ctx, "evidence"):  # AnalysisContext
             refs.update(item.ref for item in ctx.evidence)  # type: ignore[attr-defined]
-        else:  # BacktestContext pseudo-refs (documented in the prompt)
+        elif hasattr(ctx, "metrics"):  # BacktestContext pseudo-refs
             refs.add("run:" + ctx.run_id)  # type: ignore[union-attr]
             for key in ("metrics", "data_quality", "assumptions", "configuration"):
                 refs.add(f"backtest:{key}")  # type: ignore[union-attr]
+        else:  # ResearchContext pseudo-refs (documented in the prompt)
+            refs.add("run:" + ctx.run_id)  # type: ignore[union-attr]
+            for key in (
+                "objective",
+                "progress",
+                "best_candidate",
+                "out_of_sample",
+                "stability_views",
+                "warnings",
+                "disclaimers",
+            ):
+                refs.add(f"research:{key}")  # type: ignore[union-attr]
     return refs
 
 

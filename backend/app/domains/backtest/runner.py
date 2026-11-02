@@ -147,6 +147,7 @@ class BacktestRunner:
 
 
 _runner: BacktestRunner | None = None
+_runner_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _settings_for(session) -> Any:  # pragma: no cover - settings are cached
@@ -156,19 +157,32 @@ def _settings_for(session) -> Any:  # pragma: no cover - settings are cached
 
 
 def get_runner() -> BacktestRunner:
-    global _runner
-    if _runner is None:
+    """Process-wide runner, scoped to the RUNNING event loop.
+
+    Phase 8 fix: asyncio primitives bind to their loop on first contended
+    use, so a bare module singleton reused across event loops (e.g. test
+    loops, or uvicorn reload) would crash with "bound to a different
+    event loop" and strand queued runs. Recreating per loop is cheap and
+    safe: cancel events of finished runs are irrelevant and startup
+    recovery already handles rows stranded by process restarts.
+    """
+
+    global _runner, _runner_loop
+    loop = asyncio.get_running_loop()
+    if _runner is None or _runner_loop is not loop:
         from app.core.config import get_settings
 
         _runner = BacktestRunner(max_concurrent=get_settings().backtest_max_concurrent)
+        _runner_loop = loop
     return _runner
 
 
 def reset_runner() -> None:
     """Test hook: drop the singleton (settings may have changed)."""
 
-    global _runner
+    global _runner, _runner_loop
     _runner = None
+    _runner_loop = None
 
 
 __all__ = ["BacktestRunner", "get_runner", "reset_runner"]

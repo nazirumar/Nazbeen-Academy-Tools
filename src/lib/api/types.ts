@@ -1098,6 +1098,7 @@ export interface AIConversationSummary {
   title: string;
   analysis_id: string | null;
   backtest_id: string | null;
+  research_id: string | null;
   message_count: number;
   last_message_at: string | null;
   created_at: string;
@@ -1133,4 +1134,347 @@ export interface AIConversationDetail {
 export interface PaginatedAIConversations {
   items: AIConversationSummary[];
   page: PageMeta;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8 — research: optimization, walk-forward validation & robustness
+// ---------------------------------------------------------------------------
+
+export type ResearchRunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type ResearchValidationMode = "in_sample_only" | "holdout" | "walk_forward";
+
+export type ResearchObjectiveMetric =
+  | "net_pnl"
+  | "expectancy"
+  | "profit_factor"
+  | "win_rate"
+  | "avg_return_pct_per_trade"
+  | "max_drawdown_pct"
+  | "conditions_met_count";
+
+export interface ResearchParameterSpec {
+  condition_id: string;
+  field: string; // "lookback" or "params.<existing key>"
+  label?: string | null;
+  values: (number | string | boolean)[];
+}
+
+export interface ResearchObjectiveConstraints {
+  min_decided_trades?: number | null;
+  max_drawdown_pct?: number | null;
+}
+
+export interface ResearchCreateRequest {
+  mode: PlatformMode;
+  strategy_id: string;
+  strategy_version: number;
+  symbol: string;
+  timeframe?: string | null;
+  start: string;
+  end: string;
+  notes?: string | null;
+  parameters: ResearchParameterSpec[];
+  objective: {
+    metric: ResearchObjectiveMetric;
+    constraints?: ResearchObjectiveConstraints;
+  };
+  validation_mode: ResearchValidationMode;
+  holdout?: { in_sample_pct: number };
+  walk_forward?: {
+    train_candles: number;
+    test_candles: number;
+    step_candles: number;
+    window_mode: "rolling" | "expanding";
+  } | null;
+  forex_execution?: ForexExecutionConfig | null;
+  binary?: BinaryOptionsConfig | null;
+  forex_cost_variants?: Record<string, number | null>[];
+  binary_cost_variants?: Record<string, number | string | null>[];
+  param_sensitivity?: boolean;
+  run_bootstrap?: boolean;
+  seed?: number;
+}
+
+export interface ResearchProgress {
+  phase: string;
+  candidates_total: number;
+  candidates_evaluated: number;
+  candidates_failed: number;
+  candidates_invalid: number;
+  windows_total: number;
+  windows_completed: number;
+  windows_skipped: number;
+  scenarios_total: number;
+  scenarios_completed: number;
+  walks_executed: number;
+}
+
+/** Compact honest metrics digest persisted per candidate / window. */
+export interface MetricsDigest {
+  setups?: {
+    total_evaluated: number | null;
+    by_status: Record<string, number> | null;
+    first_evaluation_time: number | null;
+    last_evaluation_time: number | null;
+  };
+  trades?: {
+    total: number | null;
+    decided_trades: number | null;
+    by_outcome: Record<string, number> | null;
+    win_rate: number | null;
+    net_pnl: number | null;
+    gross_profit: number | null;
+    gross_loss: number | null;
+    expectancy: number | null;
+    profit_factor: number | null;
+    avg_return_pct_per_trade: number | null;
+    avg_holding_candles: number | null;
+    breakdowns?: {
+      by_month?: unknown;
+      by_regime?: unknown;
+    } | null;
+  };
+  equity?: {
+    start_balance: number | null;
+    end_balance: number | null;
+    max_drawdown: { max_drawdown: number | null; max_drawdown_pct: number | null } | null;
+  };
+  note?: string | null;
+  win_rate_note?: string | null;
+  simulation_mode?: string | null;
+}
+
+export interface ResearchCandidateSummary {
+  id: string;
+  run_id: string;
+  candidate_index: number;
+  status: "pending" | "evaluated" | "invalid" | "failed";
+  params: { patch: { condition_id: string; field: string; value: number | string | boolean }[]; label: string };
+  score: number | null;
+  rank: number | null;
+  selectable: boolean;
+  constraint_violations: { code: string; message: string }[];
+  rank_note: string | null;
+  times_selected: number;
+  in_sample_trades: {
+    decided_trades: number | null;
+    win_rate: number | null;
+    net_pnl: number | null;
+    expectancy: number | null;
+    profit_factor: number | null;
+  } | null;
+  out_of_sample_trades: {
+    decided_trades: number | null;
+    win_rate: number | null;
+    net_pnl: number | null;
+    expectancy: number | null;
+    profit_factor: number | null;
+  } | null;
+  error: { code?: string; message?: string } | null;
+}
+
+export interface ResearchCandidateDetail extends ResearchCandidateSummary {
+  in_sample: MetricsDigest | null;
+  out_of_sample: MetricsDigest | null;
+  rule_set: RuleSet;
+}
+
+export interface ResearchWindowSummary {
+  id: string;
+  window_index: number;
+  status: "completed" | "skipped" | "failed";
+  train_start: string;
+  train_end: string;
+  test_start: string;
+  test_end: string;
+  train_evaluations:
+    | {
+        candidate_index: number;
+        label: string | null;
+        score: number | null;
+        decided_trades: number | null;
+        constraint_violations: { code: string; message: string }[];
+      }[]
+    | null;
+  selected_candidate_index: number | null;
+  selected_params: { patch: ResearchParameterSpec[]; label: string } | null;
+  selection_score: number | null;
+  test_trades: {
+    decided_trades: number | null;
+    win_rate: number | null;
+    net_pnl: number | null;
+    expectancy: number | null;
+  } | null;
+  note: string | null;
+  error: { code?: string } | null;
+}
+
+export interface ResearchScenario {
+  id: string;
+  run_id: string;
+  scenario_index: number;
+  category: "cost_variant" | "param_neighbor" | "bootstrap" | "selection_stability";
+  label: string;
+  assumptions: Record<string, unknown>;
+  metrics: Record<string, unknown> | null;
+  delta: Record<string, unknown> | null;
+  status: "completed" | "failed";
+  note: string | null;
+  error: { code?: string; message?: string } | null;
+}
+
+export interface ResearchAggregate {
+  objective: {
+    metric: string;
+    direction: string;
+    note: string;
+    constraints: ResearchObjectiveConstraints;
+  };
+  best_candidate: {
+    candidate_index: number;
+    label: string;
+    rank: number | null;
+    score: number | null;
+    times_selected: number;
+  } | null;
+  out_of_sample: Record<string, unknown> | null;
+  stability_views: {
+    time_periods: Record<string, unknown>;
+    market_regimes: Record<string, unknown>;
+    data_quality: { overall_status: string | null; warning_codes: string[]; note: string };
+  };
+  warnings: { code: string; message: string }[];
+  disclaimers: string[];
+}
+
+export interface ResearchRun {
+  id: string;
+  owner_id: string;
+  mode: PlatformMode;
+  symbol: string;
+  timeframe: string;
+  validation_mode: ResearchValidationMode;
+  strategy_id: string | null;
+  strategy_name: string | null;
+  strategy_version: number;
+  strategy_version_id: string | null;
+  status: ResearchRunStatus;
+  start_time: string;
+  end_time: string;
+  simulation_mode: "setup_only" | "trade_simulation";
+  objective: { metric: string; note: string } | null;
+  combination_count: number | null;
+  walk_budget: number | null;
+  progress: ResearchProgress | null;
+  walks_executed: number;
+  aggregate: ResearchAggregate | null;
+  data_quality: Record<string, unknown> | null;
+  error: { code?: string; message?: string; details?: unknown[] } | null;
+  config: Record<string, unknown>;
+  research_version: string;
+  engine_version: string;
+  research_schema_version: string;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface ResearchRunListItem {
+  id: string;
+  mode: PlatformMode;
+  symbol: string;
+  timeframe: string;
+  validation_mode: ResearchValidationMode;
+  strategy_id: string | null;
+  strategy_name: string | null;
+  strategy_version: number;
+  status: ResearchRunStatus;
+  objective_metric: string | null;
+  combination_count: number | null;
+  simulation_mode: "setup_only" | "trade_simulation";
+  start_time: string;
+  end_time: string;
+  candidates_total: number | null;
+  candidates_evaluated: number | null;
+  windows_completed: number | null;
+  best_candidate: ResearchAggregate["best_candidate"];
+  error: { code?: string } | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface PaginatedResearchRuns {
+  items: ResearchRunListItem[];
+  page: PageMeta;
+}
+
+export interface PaginatedResearchCandidates {
+  items: ResearchCandidateSummary[];
+  page: PageMeta;
+}
+
+export interface PaginatedResearchWindows {
+  items: ResearchWindowSummary[];
+  page: PageMeta;
+}
+
+export interface ResearchScenariosPayload {
+  items: ResearchScenario[];
+}
+
+export interface ResearchParameterField {
+  field: string;
+  current: number | string | boolean;
+  type: "integer" | "number" | "string" | "boolean";
+  min?: number;
+  max?: number;
+}
+
+export interface ResearchParameterInventoryEntry {
+  condition_id: string;
+  condition_type: string | null;
+  timeframe: string | null;
+  fields: ResearchParameterField[];
+}
+
+export interface ResearchParameterSchema {
+  strategy_id: string;
+  strategy_version: number;
+  strategy_version_status: string;
+  mode: PlatformMode;
+  direction: string;
+  timeframes: string[];
+  parameters: ResearchParameterInventoryEntry[];
+  note: string;
+}
+
+export interface OOSAggregate {
+  windows_aggregated: number;
+  windows_with_trades: number;
+  trades: {
+    total: number;
+    decided_trades: number;
+    wins: number;
+    losses: number;
+    win_rate: number | null;
+    net_pnl: number | null;
+    expectancy: number | null;
+    profit_factor: number | null;
+  };
+  max_drawdown: { max_per_window_pct: number | null; note: string | null };
+  per_window: {
+    net_pnl: number | null;
+    win_rate: number | null;
+    decided_trades: number | null;
+    expectancy: number | null;
+    max_drawdown_pct: number | null;
+  }[];
+  skipped_windows?: { window_index: number; reason: string | null }[];
+  note?: string;
 }

@@ -28,6 +28,7 @@ def conversation_dict(row: AIConversation) -> dict[str, Any]:
         "title": row.title,
         "analysis_id": str(row.analysis_id) if row.analysis_id else None,
         "backtest_id": str(row.backtest_id) if row.backtest_id else None,
+        "research_id": str(row.research_id) if row.research_id else None,
         "message_count": row.message_count,
         "last_message_at": row.last_message_at.isoformat(timespec="milliseconds")
         if row.last_message_at
@@ -59,12 +60,14 @@ async def create_conversation(
     title: str,
     analysis_id: uuid.UUID | None = None,
     backtest_id: uuid.UUID | None = None,
+    research_id: uuid.UUID | None = None,
 ) -> AIConversation:
     row = AIConversation(
         owner_id=owner_id,
         title=title[:200],
         analysis_id=analysis_id,
         backtest_id=backtest_id,
+        research_id=research_id,
         ai_schema_version="1.0",
     )
     session.add(row)

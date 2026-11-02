@@ -92,6 +92,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 extra={"reason": f"{type(exc).__name__}: {exc}"},
             )
 
+        # Phase 8: same honest recovery for research/optimization runs.
+        try:
+            from app.domains.research import service as research_service
+
+            async with get_session_factory()() as session:
+                recovered_research = await research_service.recover_interrupted(session)
+                await session.commit()
+            if recovered_research:
+                logger.info(
+                    "research_runs_recovered", extra={"count": recovered_research}
+                )
+        except Exception as exc:  # noqa: BLE001 - startup must not fail
+            logger.warning(
+                "research_recovery_failed",
+                extra={"reason": f"{type(exc).__name__}: {exc}"},
+            )
+
         yield
         if warmup_task is not None and not warmup_task.done():
             warmup_task.cancel()

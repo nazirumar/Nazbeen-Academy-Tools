@@ -61,6 +61,9 @@ class AIConversation(Base, TimestampMixin):
     # deleting an analysis/backtest never orphans or cascades conversations).
     analysis_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     backtest_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # Phase 8: optional research/optimization run attachment (same loose
+    # reference semantics — validated against the owner at access time).
+    research_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
     ai_schema_version: Mapped[str] = mapped_column(String(8), nullable=False)
     message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

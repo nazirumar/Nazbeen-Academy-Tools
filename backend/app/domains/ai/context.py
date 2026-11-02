@@ -183,7 +183,40 @@ class BacktestContext(AIContextBase):
     assumptions: dict[str, Any] = Field(default_factory=dict)
 
 
-AIContext = AnalysisContext | BacktestContext
+class ResearchContext(AIContextBase):
+    """Minimized, validated view of one persisted research/optimization run.
+
+    The context carries ONLY stored evidence (configuration summary,
+    progress, best candidate, out-of-sample aggregate, warnings,
+    disclaimers). The AI layer never recomputes metrics — every number
+    here is copied verbatim from the run's persisted payload.
+    """
+
+    context_kind: Literal["research"] = "research"
+    run_id: str
+    mode: str
+    symbol: str
+    timeframe: str
+    validation_mode: str
+    status: str
+    strategy: StrategyRef | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    completed_at: str | None = None
+    simulation_mode: str | None = None
+    objective: dict[str, Any] | None = None
+    combination_count: int | None = None
+    walk_budget: int | None = None
+    walks_executed: int | None = None
+    progress: dict[str, Any] | None = None
+    best_candidate: dict[str, Any] | None = None
+    out_of_sample: dict[str, Any] | None = None
+    stability_views: dict[str, Any] | None = None
+    warnings: list[dict[str, Any]] = Field(default_factory=list)
+    disclaimers: list[str] = Field(default_factory=list)
+
+
+AIContext = AnalysisContext | BacktestContext | ResearchContext
 
 
 # --------------------------------------------------------------------------- #
@@ -522,11 +555,77 @@ def context_to_prompt(context: AIContext, max_chars: int) -> str:
     )
 
 
+def build_research_context(summary: dict[str, Any]) -> ResearchContext:
+    """Build the validated AI context for one research run summary.
+
+    Copies stored evidence verbatim (never recomputed, never invented).
+    Failed runs keep their error; incomplete aggregates stay incomplete —
+    the AI layer explains what was persisted, nothing more.
+    """
+
+    config = summary.get("config") or {}
+    aggregate = summary.get("aggregate") or {}
+    progress = summary.get("progress")
+    strategy = None
+    if summary.get("strategy_name"):
+        strategy = StrategyRef(
+            id=summary.get("strategy_id"),
+            name=str(summary["strategy_name"]),
+            direction=str(config.get("direction", "unknown")),
+            version=int(summary.get("strategy_version", 0)),
+            version_status=None,
+            mode=summary.get("mode"),
+        )
+    limitations = [
+        "This is a historical simulation over stored candles; it is not a "
+        "prediction and does not guarantee future performance.",
+        "The assistant explains the stored results; it never recomputes "
+        "metrics or overrides the deterministic engine.",
+    ]
+    unavailable: list[str] = []
+    if summary.get("status") != "completed":
+        unavailable.append(
+            "The run is not completed; aggregates may be partial or absent."
+        )
+    if not aggregate:
+        unavailable.append("No aggregate results were persisted for this run.")
+    if summary.get("error"):
+        unavailable.append(f"Run error: {summary['error'].get('code')}")
+    return ResearchContext(
+        built_at=_now_iso(),
+        run_id=str(summary.get("id", "")),
+        mode=str(summary.get("mode", "")),
+        symbol=str(summary.get("symbol", "")),
+        timeframe=str(summary.get("timeframe", "")),
+        validation_mode=str(summary.get("validation_mode", "")),
+        status=str(summary.get("status", "")),
+        strategy=strategy,
+        start_time=summary.get("start_time"),
+        end_time=summary.get("end_time"),
+        completed_at=summary.get("completed_at"),
+        simulation_mode=summary.get("simulation_mode"),
+        objective=summary.get("objective"),
+        combination_count=summary.get("combination_count"),
+        walk_budget=summary.get("walk_budget"),
+        walks_executed=summary.get("walks_executed"),
+        progress=progress,
+        best_candidate=aggregate.get("best_candidate"),
+        out_of_sample=aggregate.get("out_of_sample"),
+        stability_views=aggregate.get("stability_views"),
+        warnings=list(aggregate.get("warnings") or []),
+        disclaimers=list(aggregate.get("disclaimers") or []),
+        limitations=limitations,
+        unavailable=unavailable,
+    )
+
+
 __all__ = [
     "AnalysisContext",
     "BacktestContext",
     "CONTEXT_SCHEMA_VERSION",
+    "ResearchContext",
     "build_analysis_context",
     "build_backtest_context",
+    "build_research_context",
     "context_to_prompt",
 ]

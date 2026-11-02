@@ -8,6 +8,13 @@ from app.db.models.backtest import (
     BacktestRun,
 )
 from app.db.models.candle import CandleRow
+from app.db.models.research import (
+    RESEARCH_SCHEMA_VERSION,
+    ResearchCandidate,
+    ResearchRun,
+    ResearchScenario,
+    ResearchWindow,
+)
 from app.db.models.strategy import (
     DIRECTIONS,
     MODES,
@@ -27,6 +34,10 @@ __all__ = [
     "BacktestResult",
     "BacktestRun",
     "CandleRow",
+    "ResearchCandidate",
+    "ResearchRun",
+    "ResearchScenario",
+    "ResearchWindow",
     "Strategy",
     "StrategyCategory",
     "StrategyValidationResult",
@@ -37,4 +48,5 @@ __all__ = [
     "DIRECTIONS",
     "REPORT_SCHEMA_VERSION",
     "BACKTEST_SCHEMA_VERSION",
+    "RESEARCH_SCHEMA_VERSION",
 ]

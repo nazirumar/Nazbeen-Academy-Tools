@@ -31,3 +31,15 @@ if (typeof window !== "undefined") {
     Element.prototype.scrollIntoView = () => {};
   }
 }
+
+// Radix UI Select (and the research save-dialog) rely on ResizeObserver,
+// which jsdom does not implement. Minimal observer stub:
+if (typeof window !== "undefined" && !("ResizeObserver" in window)) {
+  class ResizeObserverStub {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  (window as unknown as { ResizeObserver: typeof ResizeObserverStub }).ResizeObserver =
+    ResizeObserverStub as unknown as typeof window.ResizeObserver;
+}

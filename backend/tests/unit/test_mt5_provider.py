@@ -37,8 +37,11 @@ def provider(env_settings) -> MT5Provider:
 
 def seed_history(fake, symbol: str = "EURUSD", count: int = 10,
                  end: int | None = None) -> None:
+    # Align at CALL time, not import time: a long suite can roll the
+    # minute between import and the provider call, which would flip the
+    # last candle's forming flag and make the test wall-clock flaky.
     fake.rates[(symbol, fake.TIMEFRAME_M1)] = candles_until(
-        end if end is not None else NOW_ALIGNED, count
+        end if end is not None else int(time.time()) // 60 * 60, count
     )
 
 

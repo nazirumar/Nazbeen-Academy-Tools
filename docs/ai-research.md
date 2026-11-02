@@ -120,6 +120,15 @@ Explanations reference analyses by the same id as
 `GET /api/v1/analysis/reports/{id}`; since Phase 7 that id equals the
 payload's `analysis_id` (one id everywhere).
 
+**Phase 8 addition** — research runs are first-class context: the chat
+and conversation endpoints accept `research_id` (loose, owner-validated
+reference, same semantics as `analysis_id`/`backtest_id`). The AI layer
+explains the STORED research evidence (objective, best candidate,
+out-of-sample aggregate, stability views, warnings, disclaimers) via
+`research:*` pseudo-references; it never recomputes metrics, never
+modifies research results, and never claims a strategy is profitable.
+Pseudo-refs: `run:{id}` plus one per stored section.
+
 Every answer carries: the generated explanation/answer, the validation
 summary (`schema_ok`, `evidence_refs_ok`, `numeric_trace_ok`, `safety_ok`,
 `checked_refs`), provider/model metadata and generation timestamps.
@@ -127,7 +136,8 @@ summary (`schema_ok`, `evidence_refs_ok`, `numeric_trace_ok`, `safety_ok`,
 ## Persistence (migration `f4b8e6c2a917`)
 
 * `ai_conversations` — owner-scoped; loose (non-FK) references to one
-  analysis and/or backtest, validated against the owner on every access.
+  analysis and/or backtest and/or research run (Phase 8), validated
+  against the owner on every access.
 * `ai_messages` — user questions, validated AI answers and honest `error`
   markers, each with the **exact minimized context** supplied to the
   provider (`context` JSONB) and the validation summary — every AI
@@ -145,7 +155,7 @@ are never touched.
   Distinct states: unconfigured / loading / fail-closed error / validated
   result — the deterministic report stays authoritative and visually separate.
 * **AI Research tab** (`src/components/ai/research-chat.tsx`): owner-scoped
-  conversation list, visible research context (attached analysis/backtest
+  conversation list, visible research context (attached analysis/backtest/research run
   with symbol, strategy version and timestamps), loading/empty/error states,
   suggestion prompts, and a constant reminder of what the assistant cannot do.
 * Footer and navigation updated; no existing page was redesigned.

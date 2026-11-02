@@ -41,6 +41,8 @@ import type {
   PaginatedAIConversations,
   PaginatedAnalysisReports,
   PaginatedBacktestRuns,
+  PaginatedResearchRuns,
+  ResearchRunListItem,
 } from '@/lib/api/types'
 import { cn } from '@/lib/utils'
 
@@ -65,6 +67,7 @@ const SUGGESTIONS = [
 interface ContextSelection {
   analysisId: string | null
   backtestId: string | null
+  researchId: string | null
 }
 
 interface AnalysisOption {
@@ -123,6 +126,8 @@ export function ResearchChat({ mode }: { mode: string }) {
   const [backtests, setBacktests] = useState<BacktestOption[]>([])
   const [selectedAnalysis, setSelectedAnalysis] = useState<string>('')
   const [selectedBacktest, setSelectedBacktest] = useState<string>('')
+  const [selectedResearch, setSelectedResearch] = useState<string>('')
+  const [researchRuns, setResearchRuns] = useState<BacktestOption[]>([])
   const threadRef = useRef<HTMLDivElement>(null)
 
   const unconfigured = status !== null && (!status.enabled || !status.provider_configured)
@@ -178,6 +183,20 @@ export function ResearchChat({ mode }: { mode: string }) {
         )
       })
       .catch(() => setBacktests([]))
+    // Phase 8: research runs (optimization / walk-forward) are attachable
+    // context too — the AI layer explains their stored evidence.
+    api
+      .get<PaginatedResearchRuns>('/api/v1/research/optimization', { page_size: '20' })
+      .then((page) => {
+        if (cancelled) return
+        setResearchRuns(
+          (page.items ?? []).map((r: ResearchRunListItem) => ({
+            id: r.id,
+            label: `${r.symbol} · ${r.timeframe} · ${r.strategy_name ?? 'research'} (v${r.strategy_version}) · ${r.validation_mode} · ${r.status}`,
+          })),
+        )
+      })
+      .catch(() => setResearchRuns([]))
     return () => {
       cancelled = true
     }
@@ -194,6 +213,7 @@ export function ResearchChat({ mode }: { mode: string }) {
       setDetail(d)
       setSelectedAnalysis(d.conversation.analysis_id ?? '')
       setSelectedBacktest(d.conversation.backtest_id ?? '')
+      setSelectedResearch(d.conversation.research_id ?? '')
     } catch (e) {
       toast({ title: 'Could not load conversation', description: errorText(e), variant: 'destructive' })
     } finally {
@@ -214,6 +234,7 @@ export function ResearchChat({ mode }: { mode: string }) {
     const selection: ContextSelection = {
       analysisId: selectedAnalysis || null,
       backtestId: selectedBacktest || null,
+      researchId: selectedResearch || null,
     }
     setSending(true)
     try {
@@ -222,6 +243,7 @@ export function ResearchChat({ mode }: { mode: string }) {
         conversation_id: activeId,
         analysis_id: selection.analysisId,
         backtest_id: selection.backtestId,
+        research_id: selection.researchId,
       })
       setActiveId(resp.conversation.id)
       setDetail({ conversation: resp.conversation, messages: resp.messages })
@@ -325,7 +347,7 @@ export function ResearchChat({ mode }: { mode: string }) {
               artefacts stay visible; AI answers are labelled interpretation.
             </CardDescription>
           </CardHeader>
-          <CardContent className="grid gap-3 sm:grid-cols-2">
+          <CardContent className="grid gap-3 sm:grid-cols-3">
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-muted-foreground" htmlFor="ctx-analysis">
                 Analysis report (optional)
@@ -368,11 +390,34 @@ export function ResearchChat({ mode }: { mode: string }) {
                 </SelectContent>
               </Select>
             </div>
-            {(selectedAnalysis || selectedBacktest) && (
-              <p className="text-xs text-muted-foreground sm:col-span-2" data-testid="context-chips">
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground" htmlFor="ctx-research">
+                Research run (optional)
+              </label>
+              <Select
+                value={selectedResearch}
+                onValueChange={(v) => setSelectedResearch(v === 'none-none' ? '' : v)}
+              >
+                <SelectTrigger id="ctx-research" aria-label="Attach research run">
+                  <SelectValue placeholder={researchRuns.length ? 'Attach a research run' : 'No research runs yet'} />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none-none">None</SelectItem>
+                  {researchRuns.map((r) => (
+                    <SelectItem key={r.id} value={r.id}>
+                      {r.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            {(selectedAnalysis || selectedBacktest || selectedResearch) && (
+              <p className="text-xs text-muted-foreground sm:col-span-3" data-testid="context-chips">
                 Context: {selectedAnalysis ? `analysis ${selectedAnalysis.slice(0, 8)}…` : ''}
-                {selectedAnalysis && selectedBacktest ? ' + ' : ''}
+                {selectedAnalysis && (selectedBacktest || selectedResearch) ? ' + ' : ''}
                 {selectedBacktest ? `backtest ${selectedBacktest.slice(0, 8)}…` : ''}
+                {(selectedAnalysis || selectedBacktest) && selectedResearch ? ' + ' : ''}
+                {selectedResearch ? `research ${selectedResearch.slice(0, 8)}…` : ''}
               </p>
             )}
           </CardContent>

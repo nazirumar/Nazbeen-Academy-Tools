@@ -771,6 +771,78 @@ uncertainty only), and no statement is ever a prediction or advice.
 
 ---
 
+## Phase 8 — Strategy optimization, robustness testing & walk-forward validation
+
+Phase 8 adds a **research workspace** (frontend "Research Lab" tab) that
+tests explicitly selected strategy parameters over the stored candle
+cache, separates in-sample from out-of-sample evidence, and reports
+sensitivity honestly. It reuses the Phase 6 engine (`run_walk`), the
+Phase 3 immutable strategy versions and the in-process runner
+architecture — there is no second simulation engine and no task queue.
+
+Core guarantees (enforced end-to-end, tested):
+
+* **Explicit parameters only** — a parameter varies one EXISTING field
+  (lookback or an existing `params` key) of the immutable rule-set
+  snapshot with user-selected allowed values. Optimization can never
+  invent rules or execute code; every patched candidate is revalidated
+  with the standard rule validator before any walk.
+* **Leakage prevention** — holdout runs select candidates on the
+  in-sample window and walk the held-out tail EXACTLY ONCE with the
+  frozen winner (boundary exclusion: OOS starts one interval after the
+  split). Walk-forward windows are chronological with
+  `train_end == test_start` and non-overlapping test windows
+  (`step >= test`), selection consumes training data only, and every
+  walk executes against a series clipped at its phase end (purge:
+  trades needing future candles become open/unresolved and are excluded).
+* **Honest metrics** — undefined metrics rank as `NULL` with a reason,
+  never zero; sample sizes sit next to every score; win-rate-only
+  ranking carries a warning; failed/invalid candidates are recorded.
+* **Reproducibility** — every run stores its full configuration
+  (search space, objective, split, walk-forward settings, cost
+  scenarios, seed, limits, software versions, immutable rule-set
+  snapshot). Two identical runs produce identical results.
+* **No automation** — nothing places orders, publishes strategies, or
+  claims profitability. Saving a candidate as a NEW DRAFT strategy
+  version is an explicit action through the existing Strategy Builder.
+
+Robustness scenarios (documented assumptions + deltas + limits):
+execution-cost variants (Forex spread/slippage/commission/swap, Binary
+payout/fees/tie policy), parameter-neighbour sensitivity, an OPTIONAL
+seeded i.i.d. bootstrap (bounded, not a significance test), and
+walk-forward selection stability. Derived time-period / market-regime /
+data-quality views come from the engine's own persisted breakdowns.
+
+Bounded computation via env settings (`RESEARCH_MAX_COMBINATIONS` 200,
+`RESEARCH_MAX_WALKS` 1500, `RESEARCH_MAX_WINDOWS` 40,
+`RESEARCH_MAX_COST_SCENARIOS` 6, `RESEARCH_BOOTSTRAP_SAMPLES` 200,
+`RESEARCH_MAX_CONCURRENT` 1) — configurations beyond the budget are
+rejected at creation with precise error codes.
+
+API (owner-scoped, paginated, documented in
+`docs/research-optimization-schema.md`):
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/v1/research/optimization` | validate + queue a research run |
+| GET | `/api/v1/research/optimization` | paginated run history |
+| GET | `/api/v1/research/optimization/parameter-schema` | optimizable-parameter inventory of a strategy version |
+| GET | `/api/v1/research/optimization/{run_id}` | config, progress, aggregate |
+| GET | `/api/v1/research/optimization/{run_id}/candidates` | ranked candidates (+ `/{index}` detail) |
+| GET | `/api/v1/research/optimization/{run_id}/walk-forward` | chronological window results |
+| GET | `/api/v1/research/optimization/{run_id}/robustness` | robustness scenarios |
+| POST | `/api/v1/research/optimization/{run_id}/cancel` | cooperative cancellation |
+
+Fixes applied to previous phases during Phase 8 (minimal, documented in
+code): the Phase 6 engine never called `forex.settle()` after exit
+resolution, so realized P&L stayed `NULL` and every Forex trade was
+recorded as a tie (equity never moved); and both runner singletons
+could crash with "bound to a different event loop" when their
+semaphore was first contended from a different loop — both runners are
+now loop-scoped. All pre-existing suites still pass.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause & fix |
@@ -829,7 +901,7 @@ uncertainty only), and no statement is ever a prediction or advice.
 9. `docker compose` builds the frontend in dev mode; the production build
    path (`Dockerfile.frontend`) was not exercised inside the sandbox.
 
-## Recommended next step: Phase 8 — candidate directions
+## Recommended next step: Phase 9 — candidate directions
 
 1. WebSocket streaming of candle updates + status changes; the frontend
    client already isolates all backend I/O in one module, and the backtest

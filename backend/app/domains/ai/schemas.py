@@ -26,6 +26,9 @@ class ChatRequest(BaseModel):
     # artefacts; per-message references may extend them.
     analysis_id: uuid.UUID | None = None
     backtest_id: uuid.UUID | None = None
+    # Phase 8: optionally attach a research/optimization run (validated
+    # against the requesting owner before anything is fetched).
+    research_id: uuid.UUID | None = None
     title: str | None = Field(default=None, max_length=TITLE_MAX_CHARS)
 
     @model_validator(mode="after")
@@ -41,6 +44,7 @@ class ConversationCreateRequest(BaseModel):
     title: str | None = Field(default=None, max_length=TITLE_MAX_CHARS)
     analysis_id: uuid.UUID | None = None
     backtest_id: uuid.UUID | None = None
+    research_id: uuid.UUID | None = None
 
     @model_validator(mode="after")
     def _sane_title(self) -> "ConversationCreateRequest":

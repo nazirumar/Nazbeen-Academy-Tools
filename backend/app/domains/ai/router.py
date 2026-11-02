@@ -96,6 +96,7 @@ async def research_chat(
             conversation_id=payload.conversation_id,
             analysis_id=payload.analysis_id,
             backtest_id=payload.backtest_id,
+            research_id=payload.research_id,
             title=payload.title,
         )
     )
@@ -128,7 +129,7 @@ async def create_conversation(
     creation time — the assistant only ever explains saved results.
     """
     # Validate optional references eagerly (owner-scoped 404s).
-    if payload.analysis_id or payload.backtest_id:
+    if payload.analysis_id or payload.backtest_id or payload.research_id:
         await ai_service.resolve_contexts(
             session,
             owner,
@@ -136,6 +137,7 @@ async def create_conversation(
             conversation_backtest_id=None,
             request_analysis_id=payload.analysis_id,
             request_backtest_id=payload.backtest_id,
+            request_research_id=payload.research_id,
         )
     row = await conversation_service.create_conversation(
         session,
@@ -143,6 +145,7 @@ async def create_conversation(
         title=payload.title or "Research chat",
         analysis_id=payload.analysis_id,
         backtest_id=payload.backtest_id,
+        research_id=payload.research_id,
     )
     return created(conversation_service.conversation_dict(row))
 

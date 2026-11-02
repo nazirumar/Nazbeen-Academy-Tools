@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect } from 'react'
-import { ChartLine, ChartCandlestick, FlaskConical, Gauge, LayoutDashboard, Library, BrainCircuit } from 'lucide-react'
+import { ChartLine, ChartCandlestick, FlaskConical, Gauge, LayoutDashboard, Library, BrainCircuit, Microscope } from 'lucide-react'
 import { AppShell } from '@/components/layout/app-shell'
 import { SystemStatus } from '@/components/status/system-status'
 import { MT5StatusPanel } from '@/components/market/mt5-status-panel'
@@ -10,6 +10,7 @@ import { StrategyLibrary } from '@/components/strategies/strategy-library'
 import { AnalysisWorkbench } from '@/components/analysis/analysis-workbench'
 import { MarketDashboard } from '@/components/dashboard/market-dashboard'
 import { BacktestWorkspace } from '@/components/backtest/backtest-workspace'
+import { ResearchWorkspace } from '@/components/research/research-workspace'
 import { ResearchChat } from '@/components/ai/research-chat'
 import { ErrorBoundary } from '@/components/error-boundary'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -47,6 +48,9 @@ export default function Home() {
           <TabsTrigger value="backtests" className="gap-1.5">
             <FlaskConical className="h-4 w-4" aria-hidden /> Backtests
           </TabsTrigger>
+          <TabsTrigger value="research-lab" className="gap-1.5">
+            <Microscope className="h-4 w-4" aria-hidden /> Research Lab
+          </TabsTrigger>
           <TabsTrigger value="research" className="gap-1.5">
             <BrainCircuit className="h-4 w-4" aria-hidden /> AI Research
           </TabsTrigger>
@@ -78,6 +82,12 @@ export default function Home() {
         <TabsContent value="backtests" className="mt-0">
           <ErrorBoundary label="Backtesting workspace">
             <BacktestWorkspace key={mode} mode={mode} />
+          </ErrorBoundary>
+        </TabsContent>
+
+        <TabsContent value="research-lab" className="mt-0">
+          <ErrorBoundary label="Research workspace">
+            <ResearchWorkspace key={mode} mode={mode} />
           </ErrorBoundary>
         </TabsContent>
 

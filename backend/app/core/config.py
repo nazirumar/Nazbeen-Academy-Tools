@@ -118,6 +118,28 @@ class Settings(BaseSettings):
     # architecture is documented — no external task queue is introduced).
     backtest_max_concurrent: int = Field(default=1, ge=1, le=8)
 
+    # --- Research / optimization (Phase 8) -------------------------------------
+    # Bounded computation for parameter optimization and walk-forward
+    # validation (in-process runner, same architecture as backtests).
+    # Hard cap on distinct parameter combinations per research run.
+    research_max_combinations: int = Field(default=200, ge=1, le=5_000)
+    # Hard cap on parameter definitions per run (search-space dimensions).
+    research_max_parameters: int = Field(default=8, ge=1, le=32)
+    # Hard cap on allowed values per parameter dimension.
+    research_max_values_per_parameter: int = Field(default=12, ge=1, le=64)
+    # Hard cap on total engine walks per run (candidates x phases + robustness
+    # scenarios). Keeps worst-case computation predictable.
+    research_max_walks: int = Field(default=1_500, ge=10, le=50_000)
+    # Hard cap on walk-forward windows per run.
+    research_max_windows: int = Field(default=40, ge=1, le=500)
+    # Hard cap on execution-cost sensitivity scenarios per run.
+    research_max_cost_scenarios: int = Field(default=6, ge=0, le=24)
+    # Bootstrap resamples for the OPTIONAL randomized stress test
+    # (0 disables the scenario entirely). Bounded computation, seeded.
+    research_bootstrap_samples: int = Field(default=200, ge=0, le=2_000)
+    # Concurrent in-process research executions (single-process runner).
+    research_max_concurrent: int = Field(default=1, ge=1, le=4)
+
     # --- AI research layer (Phase 7) -------------------------------------------------
     # The AI layer EXPLAINS existing deterministic analysis results; it never
     # replaces the engine, never evaluates rules, never writes to the database

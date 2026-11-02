@@ -367,6 +367,12 @@ def run_walk(
             trade = forex_sim.resolve_exit(
                 trade, primary_series.candles, idx + 1, forex_cfg, pip_size
             )
+            # Phase 8 fix: realized P&L was never computed because
+            # ``settle`` was not called after exit resolution — every
+            # resolved trade stayed at pnl None / outcome "tie" and the
+            # equity path never moved. settle() uses ONLY the declared
+            # cost assumptions (no new data, no fabrication).
+            trade = forex_sim.settle(trade, forex_cfg, pip_size, balance)
             outcome = trade.outcome
             if outcome in ("win", "loss", "tie") and trade.pnl is not None:
                 balance = round(balance + trade.pnl, 8)

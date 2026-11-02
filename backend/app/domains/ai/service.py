@@ -30,8 +30,10 @@ from app.domains.ai import prompts
 from app.domains.ai.context import (
     AnalysisContext,
     BacktestContext,
+    ResearchContext,
     build_analysis_context,
     build_backtest_context,
+    build_research_context,
 )
 from app.domains.ai.errors import (
     AIValidationError,
@@ -56,6 +58,7 @@ from app.domains.ai.validation import (
 from app.core.errors import ValidationAppError
 from app.domains.analysis import reports as report_service
 from app.domains.backtest import service as backtest_service
+from app.domains.research import service as research_service
 
 logger = get_logger(__name__)
 
@@ -192,7 +195,9 @@ async def resolve_contexts(
     conversation_backtest_id: uuid.UUID | None,
     request_analysis_id: uuid.UUID | None,
     request_backtest_id: uuid.UUID | None,
-) -> tuple[list[AnalysisContext | BacktestContext], list[dict[str, Any]]]:
+    conversation_research_id: uuid.UUID | None = None,
+    request_research_id: uuid.UUID | None = None,
+) -> tuple[list[AnalysisContext | BacktestContext | ResearchContext], list[dict[str, Any]]]:
     """Validate every referenced artefact against the owner, then build.
 
     Returns (contexts, refs_used). Foreign-owned references are 404s —
@@ -200,6 +205,7 @@ async def resolve_contexts(
     """
     analysis_ids: list[uuid.UUID] = []
     backtest_ids: list[uuid.UUID] = []
+    research_ids: list[uuid.UUID] = []
     if conversation_analysis_id:
         analysis_ids.append(conversation_analysis_id)
     if request_analysis_id and request_analysis_id not in analysis_ids:
@@ -208,16 +214,21 @@ async def resolve_contexts(
         backtest_ids.append(conversation_backtest_id)
     if request_backtest_id and request_backtest_id not in backtest_ids:
         backtest_ids.append(request_backtest_id)
+    if conversation_research_id:
+        research_ids.append(conversation_research_id)
+    if request_research_id and request_research_id not in research_ids:
+        research_ids.append(request_research_id)
 
-    if not analysis_ids and not backtest_ids:
+    if not analysis_ids and not backtest_ids and not research_ids:
         raise ValidationAppError(
-            "No analysis or backtest attached. Attach one via the request "
-            "(analysis_id / backtest_id) or start the conversation with a "
-            "reference — the assistant only explains saved results.",
+            "No analysis, backtest or research run attached. Attach one via "
+            "the request (analysis_id / backtest_id / research_id) or start "
+            "the conversation with a reference — the assistant only "
+            "explains saved results.",
             code="NO_CONTEXT_ATTACHED",
         )
 
-    contexts: list[AnalysisContext | BacktestContext] = []
+    contexts: list[AnalysisContext | BacktestContext | ResearchContext] = []
     refs: list[dict[str, Any]] = []
     for aid in analysis_ids:
         row = await report_service.get_report(session, owner, aid)  # 404 scoped
@@ -227,6 +238,10 @@ async def resolve_contexts(
         run = await backtest_service.get_run(session, owner, bid)  # 404 scoped
         contexts.append(build_backtest_context(backtest_service.run_summary(run)))
         refs.append({"kind": "backtest", "id": str(bid)})
+    for rid in research_ids:
+        run = await research_service.get_run(session, owner, rid)  # 404 scoped
+        contexts.append(build_research_context(research_service.run_summary(run)))
+        refs.append({"kind": "research", "id": str(rid)})
     return contexts, refs
 
 
@@ -239,6 +254,7 @@ async def research_chat(
     conversation_id: uuid.UUID | None = None,
     analysis_id: uuid.UUID | None = None,
     backtest_id: uuid.UUID | None = None,
+    research_id: uuid.UUID | None = None,
     title: str | None = None,
     provider: LLMProvider | None = None,
 ) -> dict[str, Any]:
@@ -259,6 +275,7 @@ async def research_chat(
             title=default_title,
             analysis_id=analysis_id,
             backtest_id=backtest_id,
+            research_id=research_id,
         )
 
     # 2) Validate every referenced artefact BEFORE fetching anything.
@@ -269,6 +286,8 @@ async def research_chat(
         conversation_backtest_id=conversation.backtest_id,
         request_analysis_id=analysis_id,
         request_backtest_id=backtest_id,
+        conversation_research_id=getattr(conversation, "research_id", None),
+        request_research_id=research_id,
     )
 
     # 3) Persist the user question FIRST (the question survives failures).

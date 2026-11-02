@@ -15,17 +15,18 @@ from tests.fakes.fake_mt5 import candles_until
 
 pytestmark = pytest.mark.integration
 
-# M1-aligned "now" so forming/staleness math matches real time.
-BASE_EPOCH = int(time.time()) // 60 * 60
-
-
+# M1-aligned "now" so forming/staleness math matches real time. Aligned at
+# CALL time (not import): a long suite can roll the minute between import
+# and the request, flipping the last candle's forming flag and making the
+# tests wall-clock flaky.
 @pytest.fixture
 def seeded_history(fake_mt5):
+    base = int(time.time()) // 60 * 60
     fake_mt5.rates[("EURUSD", fake_mt5.TIMEFRAME_M1)] = candles_until(
-        BASE_EPOCH, 50
+        base, 50
     )
     fake_mt5.rates[("EURUSD", fake_mt5.TIMEFRAME_H1)] = candles_until(
-        BASE_EPOCH - 3 * 3600, 50, step=3600
+        base - 3 * 3600, 50, step=3600
     )
     return fake_mt5
 
