@@ -1,11 +1,19 @@
-"""API v1 router aggregation + platform metadata endpoint."""
+"""API v1 router aggregation + platform metadata endpoint.
+
+Every ``/api/v1`` route is guarded by ``require_api_auth`` (Phase 9): when
+API tokens are configured, requests must present a valid bearer token;
+without configuration (local single-user mode) the guard is a no-op.
+Health endpoints (``/health/*``) are intentionally outside this router and
+stay unauthenticated for infrastructure probes.
+"""
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 import app
 from app.api.health import router as health_router
+from app.core.auth import require_api_auth
 from app.core.responses import ok
 from app.domains.ai.router import router as ai_router
 from app.domains.analysis.router import router as analysis_router
@@ -31,7 +39,7 @@ from app.domains.strategies.rules import (
     SUPPORTED_OPERATORS,
 )
 
-api_v1_router = APIRouter()
+api_v1_router = APIRouter(dependencies=[Depends(require_api_auth)])
 api_v1_router.include_router(market_data_router)
 api_v1_router.include_router(mt5_router)
 api_v1_router.include_router(market_router)

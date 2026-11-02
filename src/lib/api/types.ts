@@ -397,7 +397,9 @@ export interface StrategyValidateResponse extends RuleSetValidation {
 // --------------------------------------------------------------------------- //
 
 export interface ParamFieldSchema {
-  type: "string" | "number" | "integer";
+  // Mirrors the backend rule registry: 'boolean' params are supported
+  // (checkbox rendering in the strategy builder).
+  type: "string" | "number" | "integer" | "boolean";
   enum?: string[];
   description?: string;
   minimum?: number;

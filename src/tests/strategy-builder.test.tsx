@@ -12,6 +12,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ApiError } from "@/lib/api/types";
 import type {
+  RuleSet,
   RuleSetValidation,
   StrategyDetail,
   StrategyVersion,
@@ -83,7 +84,7 @@ const RULE_TYPES = {
   ],
 };
 
-const storedRuleSet = {
+const storedRuleSet: RuleSet = {
   schema_version: "2.0",
   mode: "forex",
   timeframes: ["H1"],

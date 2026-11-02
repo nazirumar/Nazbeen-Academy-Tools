@@ -19,6 +19,23 @@ const ORIGIN = (process.env.NEXT_PUBLIC_BACKEND_ORIGIN ?? "").replace(/\/$/, "")
 const PORT = process.env.NEXT_PUBLIC_BACKEND_PORT ?? "8000";
 const REQUEST_TIMEOUT_MS = 20_000;
 
+/**
+ * Optional deployment access token (Phase 9).
+ *
+ * Set NEXT_PUBLIC_API_TOKEN when the backend requires bearer authentication
+ * (the backend mandates it in APP_ENV=production). Every request then sends
+ * `Authorization: Bearer <token>`.
+ *
+ * HONEST SECURITY NOTE: this value is part of the public client bundle — it
+ * gates the UI like a site password (stops strangers and drive-by scanners)
+ * but must NOT be treated as a per-user secret. For per-owner access control
+ * configure API_AUTH_TOKENS with `token:owner` bindings server-side, and for
+ * fully private deployments keep the backend off the public internet (see
+ * docs/operations.md). The token is never logged by this client and is
+ * stripped from thrown error messages.
+ */
+const API_TOKEN = (process.env.NEXT_PUBLIC_API_TOKEN ?? "").trim();
+
 export function backendUrl(path: string, query?: Record<string, string>): string {
   const search = new URLSearchParams(query ?? {});
   if (!ORIGIN) {
@@ -62,11 +79,15 @@ async function request<T>(
 ): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  // Security: never log the token; only its presence is surfaced in errors.
+  const headers: Record<string, string> = {};
+  if (API_TOKEN) headers["Authorization"] = `Bearer ${API_TOKEN}`;
+  if (options.body !== undefined) headers["Content-Type"] = "application/json";
   let response: Response;
   try {
     response = await fetch(backendUrl(path, options.query), {
       method,
-      headers: options.body !== undefined ? { "Content-Type": "application/json" } : undefined,
+      headers,
       body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
       signal: controller.signal,
       cache: "no-store",

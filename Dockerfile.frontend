@@ -1,4 +1,11 @@
 # TA Platform frontend — Next.js 16 standalone build (bun matches bun.lock).
+#
+# Phase 9 hardening:
+# - frozen-lockfile install (reproducible), multi-stage build
+# - runner executes as a non-root user with a writable HOME
+# - built-in healthcheck against the Next.js server
+# - only NEXT_PUBLIC_* variables are baked in (public by definition); server-only
+#   secrets are never part of any image layer
 FROM oven/bun:1 AS deps
 WORKDIR /app
 COPY package.json bun.lock ./
@@ -12,8 +19,12 @@ COPY . .
 # Public runtime configuration is baked into the client bundle at build time.
 ARG NEXT_PUBLIC_BACKEND_ORIGIN=http://localhost:8000
 ARG NEXT_PUBLIC_BACKEND_PORT=8000
+# Optional deployment access token (see docs/operations.md for the honest
+# security note: it gates the UI, it is not a per-user secret).
+ARG NEXT_PUBLIC_API_TOKEN=""
 ENV NEXT_PUBLIC_BACKEND_ORIGIN=$NEXT_PUBLIC_BACKEND_ORIGIN \
     NEXT_PUBLIC_BACKEND_PORT=$NEXT_PUBLIC_BACKEND_PORT \
+    NEXT_PUBLIC_API_TOKEN=$NEXT_PUBLIC_API_TOKEN \
     NEXT_TELEMETRY_DISABLED=1
 
 RUN bun run build
@@ -23,8 +34,18 @@ WORKDIR /app
 ENV NODE_ENV=production \
     PORT=3000 \
     HOSTNAME=0.0.0.0 \
+    HOME=/tmp \
     NEXT_TELEMETRY_DISABLED=1
 # package.json "build" already assembles .next/standalone (incl. static + public).
 COPY --from=build /app/.next/standalone ./
+
+# Non-root runtime user (the bun image ships a 'bun' user).
+RUN chown -R bun:bun /app
+USER bun
+
 EXPOSE 3000
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
+  CMD bun -e "fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+
 CMD ["bun", "server.js"]

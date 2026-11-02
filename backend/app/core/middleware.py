@@ -67,3 +67,42 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             },
         )
         return response
+
+
+# --------------------------------------------------------------------------- #
+# Phase 9: security headers on every API response
+# --------------------------------------------------------------------------- #
+
+#: Applied to API + health responses. The API serves JSON only, so a
+#: restrictive CSP is safe here; the (local-only) /docs pages are excluded.
+API_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Defence-in-depth headers on API and health responses.
+
+    ``X-Content-Type-Options`` stops MIME sniffing, ``X-Frame-Options`` /
+    ``frame-ancestors`` mitigate clickjacking, ``Referrer-Policy`` avoids
+    leaking URLs (which can contain query parameters) to other origins, and
+    ``Cache-Control: no-store`` keeps API payloads (which include user data)
+    out of shared caches. Swagger/OpenAPI routes are excluded: their UI loads
+    remote assets and would break under the strict CSP (and is disabled in
+    production anyway).
+    """
+
+    EXEMPT_PREFIXES = ("/docs", "/redoc", "/openapi.json")
+
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        response = await call_next(request)
+        path = request.url.path
+        if any(path.startswith(p) for p in self.EXEMPT_PREFIXES):
+            return response
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Content-Security-Policy", API_CSP)
+        if path.startswith(("/api/", "/health")):
+            response.headers.setdefault("Cache-Control", "no-store")
+        return response

@@ -21,10 +21,11 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 os.environ["APP_ENV"] = "test"
 os.environ["LOG_FORMAT"] = "console"
 os.environ.setdefault("CORS_ORIGINS", "")
-# The research creation rate limit defaults to a production-safe value;
-# the integration suite creates many runs per minute, so tests run with a
-# much higher cap and exercise the limiter explicitly (429 test).
+# The research/backtest creation rate limits default to production-safe
+# values; the integration suite creates many runs per minute, so tests run
+# with a much higher cap and exercise the limiters explicitly (429 tests).
 os.environ.setdefault("RESEARCH_MAX_CREATES_PER_MINUTE", "1000")
+os.environ.setdefault("BACKTEST_MAX_CREATES_PER_MINUTE", "1000")
 
 
 @pytest.fixture(scope="session")
@@ -68,11 +69,20 @@ def database_url() -> str:
 
 
 @pytest.fixture
-async def app_client(database_url: str):
+async def app_client(request, database_url: str):
     """Async httpx client bound to the ASGI app with engine initialized.
 
     All tables are truncated BEFORE each test (deterministic isolation).
+
+    Indirect parametrization: a test may pass a dict of extra environment
+    variables via ``pytest.mark.parametrize("app_client", [{...}],
+    indirect=True)`` — applied before settings are built (e.g. API auth
+    tokens) and removed after the test so they never leak into other tests.
     """
+
+    extra_env: dict[str, str] = dict(getattr(request, "param", None) or {})
+    for key, value in extra_env.items():
+        os.environ[key] = value
 
     from fastapi import FastAPI  # noqa: F401
     from httpx import ASGITransport, AsyncClient
@@ -101,11 +111,16 @@ async def app_client(database_url: str):
     application = create_app(settings)
 
     transport = ASGITransport(app=application)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        yield client
-
-    await dispose_engine()
-    get_settings.cache_clear()
+    try:
+        async with AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            yield client
+    finally:
+        for key in extra_env:
+            os.environ.pop(key, None)
+        await dispose_engine()
+        get_settings.cache_clear()
 
 
 # --------------------------------------------------------------------------- #

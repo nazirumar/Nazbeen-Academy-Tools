@@ -18,7 +18,11 @@ from app.api.v1 import api_v1_router, health_router
 from app.core.config import Settings, get_settings
 from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging, get_logger
-from app.core.middleware import RequestIdMiddleware, RequestLoggingMiddleware
+from app.core.middleware import (
+    RequestIdMiddleware,
+    RequestLoggingMiddleware,
+    SecurityHeadersMiddleware,
+)
 from app.core.responses import ok
 from app.db.session import dispose_engine, get_session_factory, init_engine
 
@@ -72,8 +76,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "market_data_provider": settings.market_data_provider,
                 "mt5_enabled": settings.mt5_enabled,
                 "docs_enabled": settings.enable_docs,
+                "auth": settings.auth_config_summary(),
             },
         )
+        # Phase 9: be loud (but honest) when an explicitly multi-user or
+        # internet-facing environment runs without API authentication.
+        if not settings.api_auth_enabled and settings.app_env in (
+            "development",
+            "staging",
+        ):
+            logger.warning(
+                "api_auth_disabled",
+                extra={
+                    "env": settings.app_env,
+                    "hint": "Set API_AUTH_TOKEN or API_AUTH_TOKENS to require "
+                    "bearer authentication on /api/v1 (mandatory in production).",
+                },
+            )
 
         # Phase 6: honest startup recovery — runs left queued/running by a
         # previous process are marked failed (in-process runs do not
@@ -129,7 +148,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     # Middleware order: last added runs first (outermost). CORS must see the
-    # request first; logging wraps everything; request-id is innermost.
+    # request first; security headers wrap everything; logging next;
+    # request-id is innermost.
+    app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(RequestLoggingMiddleware)
     app.add_middleware(RequestIdMiddleware)
     if settings.cors_origins:

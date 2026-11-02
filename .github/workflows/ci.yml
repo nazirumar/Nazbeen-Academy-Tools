@@ -1,0 +1,110 @@
+# =============================================================================
+# TA Platform — CI quality gates (Phase 9)
+# =============================================================================
+# Runs on every push and pull request:
+#   1. backend: real-PostgreSQL test suite (unit + integration), migration
+#      validation (Alembic upgrade from empty DB happens inside the suite),
+#      import/startup validation, backup/restore verification.
+#   2. frontend: lint, type check, vitest, production build (type errors FAIL
+#      the build — ignoreBuildErrors is disabled).
+#   3. security: secret scanning + Python dependency audit.
+#
+# Known limitations (honest):
+# - The frontend dependency audit is not wired (bun.lock has no stable audit
+#   command across CI runners); review `bun pm ls` updates manually.
+# - Docker image builds are not exercised here (no builder available); run
+#   `docker compose build` before deploying (see docs/operations.md).
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests (real PostgreSQL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+
+      - name: Import / startup validation (fail fast on config errors)
+        working-directory: backend
+        env:
+          APP_ENV: test
+          DATABASE_URL: postgresql+asyncpg://ta_user:pw@localhost:5432/ta_platform
+        run: python -c "from app.main import create_app; create_app(); print('app factory OK')"
+
+      - name: Run tests (unit + integration; conftest migrates an empty DB via Alembic)
+        working-directory: backend
+        run: python -m pytest tests/ -q
+
+      - name: Backup & restore verification (disposable databases)
+        run: ./scripts/verify-backup-restore.sh
+
+  frontend:
+    name: Frontend lint, type check, tests, production build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1"
+
+      - name: Install dependencies (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Lint (ESLint)
+        run: bun run lint
+
+      - name: Type check (tsc --noEmit)
+        run: bunx tsc --noEmit
+
+      - name: Unit tests (vitest)
+        run: bun run test
+
+      - name: Production build (type errors fail the build)
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: bun run build
+
+  security:
+    name: Secret scanning & dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Secret scanning (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python dependency audit (pip-audit)
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip install -r requirements.txt
+          pip-audit --strict --skip-editable

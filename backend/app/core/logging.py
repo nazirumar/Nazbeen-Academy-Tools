@@ -15,8 +15,10 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone
+from typing import Any
 
 request_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "request_id", default=None
@@ -28,6 +30,86 @@ _RESERVED_LOGRECORD_ATTRS = {
     "created", "msecs", "relativeCreated", "thread", "threadName",
     "processName", "process", "taskName", "message", "asctime",
 }
+
+# --------------------------------------------------------------------------- #
+# Phase 9: defence-in-depth secret redaction for EVERY log record.
+#
+# The AI layer has its own, stricter redaction for user chat text
+# (app/domains/ai/secrets.py). This layer protects the log stream itself:
+# no matter which module logs an ``extra`` payload, credential-shaped keys
+# and credential-shaped values never reach the handlers in clear text.
+#
+# Documented limit (honest): pattern-based redaction catches the common
+# shapes; it cannot guarantee that every conceivable secret format is
+# caught. Modules must therefore still avoid logging secrets in the first
+# place — this is a safety net, not a licence.
+# --------------------------------------------------------------------------- #
+
+_REDACTED = "***"
+
+#: Substrings (lower-cased) that mark an ``extra`` key as sensitive.
+_SENSITIVE_KEY_MARKERS = (
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "credential",
+    "cookie",
+    "database_url",
+    "connection_string",
+)
+
+#: Credential-shaped values inside free-text strings.
+_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Authorization/bearer header values
+    re.compile(r"(?i)\b(bearer|authorization)\b[\s:]*[A-Za-z0-9._\-+/=]{12,}"),
+    # OpenAI-style / generic secret prefixes
+    re.compile(r"\b(sk|pk|rk)-[A-Za-z0-9._\-]{10,}"),
+    # URL credentials scheme://user:password@host
+    re.compile(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@"),
+)
+
+
+def redact_text(value: str) -> str:
+    """Redact credential-shaped substrings inside a free-text string."""
+
+    for pattern in _VALUE_PATTERNS:
+        value = pattern.sub(lambda m: m.group(1) + _REDACTED, value)
+    return value
+
+
+def _is_sensitive_key(key: str) -> bool:
+    lowered = key.lower()
+    return any(marker in lowered for marker in _SENSITIVE_KEY_MARKERS)
+
+
+def redact_mapping(extra: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``extra`` safe for logging.
+
+    * Sensitive key names → value replaced entirely.
+    * Strings → credential-shaped substrings redacted.
+    * dicts/lists → recursed (bounded depth for safety).
+    """
+
+    def _walk(value: Any, depth: int) -> Any:
+        if depth > 6:
+            return _REDACTED
+        if isinstance(value, dict):
+            return {
+                str(k): (_REDACTED if _is_sensitive_key(str(k)) else _walk(v, depth + 1))
+                for k, v in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [_walk(item, depth + 1) for item in value]
+        if isinstance(value, str):
+            return redact_text(value)
+        return value
+
+    return _walk(extra, 0)
 
 
 class JsonFormatter(logging.Formatter):
@@ -45,16 +127,15 @@ class JsonFormatter(logging.Formatter):
         request_id = request_id_var.get()
         if request_id:
             payload["request_id"] = request_id
-        for key, value in record.__dict__.items():
-            if key not in _RESERVED_LOGRECORD_ATTRS and not key.startswith("_"):
-                try:
-                    json.dumps(value)
-                    payload[key] = value
-                except (TypeError, ValueError):
-                    payload[key] = repr(value)
+        extras = {
+            key: value
+            for key, value in record.__dict__.items()
+            if key not in _RESERVED_LOGRECORD_ATTRS and not key.startswith("_")
+        }
+        payload.update(redact_mapping(extras))
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False)
+        return json.dumps(payload, ensure_ascii=False, default=repr)
 
 
 class ConsoleFormatter(logging.Formatter):
@@ -81,6 +162,7 @@ class ConsoleFormatter(logging.Formatter):
             for key, value in record.__dict__.items()
             if key not in _RESERVED_LOGRECORD_ATTRS and not key.startswith("_")
         }
+        extras = redact_mapping(extras)
         if extras:
             base += f" | {extras}"
         if record.exc_info:

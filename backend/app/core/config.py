@@ -9,10 +9,11 @@ do NOT crash the app: they are reported honestly by `/health/ready`.
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 AppEnv = Literal["local", "development", "test", "staging", "production"]
@@ -68,6 +69,18 @@ class Settings(BaseSettings):
     # pydantic-settings would otherwise demand JSON for list fields.
     cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
+    # --- API authentication (Phase 9) -------------------------------------------
+    # Bearer tokens guarding every /api/v1 endpoint. Server-side only: never
+    # accepted by endpoints, never logged, never returned to clients.
+    #   API_AUTH_TOKEN  — one deployment-wide token (X-User-Id scoping stays).
+    #   API_AUTH_TOKENS — CSV of "token" or "token:owner" entries; a bound
+    #                     token locks requests to its owner (X-User-Id ignored).
+    # APP_ENV=production REQUIRES at least one token (fail fast at startup).
+    api_auth_token: str = ""
+    api_auth_tokens: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Resolved (token, bound_owner_or_None) pairs, built by a validator.
+    _resolved_api_tokens: list[tuple[str, str | None]] = PrivateAttr(default_factory=list)
+
     # --- Observability ----------------------------------------------------------
     log_level: LogLevel = "INFO"
     log_format: LogFormat = "json"
@@ -117,6 +130,9 @@ class Settings(BaseSettings):
     # Concurrent in-process backtest executions (single-process runner; the
     # architecture is documented — no external task queue is introduced).
     backtest_max_concurrent: int = Field(default=1, ge=1, le=8)
+    # Per-owner cap on NEW backtest runs per minute (creation rate limit,
+    # Phase 9 — mirrors the research/AI limiter; read/cancel are not throttled).
+    backtest_max_creates_per_minute: int = Field(default=10, ge=1, le=10_000)
 
     # --- Research / optimization (Phase 8) -------------------------------------
     # Bounded computation for parameter optimization and walk-forward
@@ -314,6 +330,81 @@ class Settings(BaseSettings):
             "rules and never writes to the database.",
         }
 
+    @field_validator("api_auth_tokens", mode="before")
+    @classmethod
+    def _parse_api_auth_tokens(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [entry.strip() for entry in value.split(",") if entry.strip()]
+        return value
+
+    @model_validator(mode="after")
+    def _auth_tokens_consistency(self) -> "Settings":
+        """Parse and validate token configuration (fail fast, never log values)."""
+
+        owner_pattern = re.compile(r"^[A-Za-z0-9._@-]+$")
+        resolved: list[tuple[str, str | None]] = []
+        seen: dict[str, str | None] = {}
+
+        raw_entries: list[tuple[str, str | None]] = []
+        if self.api_auth_token.strip():
+            raw_entries.append((self.api_auth_token.strip(), None))
+        for entry in self.api_auth_tokens:
+            token, sep, owner = entry.partition(":")
+            token = token.strip()
+            owner = owner.strip() if sep else None
+            if sep and not owner:
+                raise ConfigError(
+                    "API_AUTH_TOKENS entries with an owner binding must look like "
+                    "'token:owner' (empty owner is not allowed)."
+                )
+            raw_entries.append((token, owner or None))
+
+        for token, owner in raw_entries:
+            if len(token) < 12:
+                raise ConfigError(
+                    "API auth tokens must be at least 12 characters "
+                    "(received a too-short token)."
+                )
+            if not re.fullmatch(r"[!-~]+", token):
+                raise ConfigError(
+                    "API auth tokens must be printable ASCII without whitespace."
+                )
+            if owner is not None and not owner_pattern.fullmatch(owner):
+                raise ConfigError(
+                    "API_AUTH_TOKENS owner bindings must be 1-64 characters from "
+                    "[A-Za-z0-9._@-]."
+                )
+            if token in seen and seen[token] != owner:
+                raise ConfigError(
+                    "The same API auth token was configured twice with different "
+                    "owner bindings."
+                )
+            if token not in seen:
+                seen[token] = owner
+                resolved.append((token, owner))
+
+        self._resolved_api_tokens = resolved
+        return self
+
+    @property
+    def resolved_api_tokens(self) -> list[tuple[str, str | None]]:
+        """Validated (token, bound_owner_or_None) pairs (empty = auth disabled)."""
+        return self._resolved_api_tokens
+
+    @property
+    def api_auth_enabled(self) -> bool:
+        return bool(self._resolved_api_tokens)
+
+    def auth_config_summary(self) -> dict[str, object]:
+        """Safe-to-publish authentication summary (never includes tokens)."""
+        return {
+            "enabled": self.api_auth_enabled,
+            "token_count": len(self._resolved_api_tokens),
+            "bound_owner_count": sum(
+                1 for _, owner in self._resolved_api_tokens if owner is not None
+            ),
+        }
+
     @model_validator(mode="after")
     def _environ_consistency(self) -> "Settings":
         if self.app_env == "production":
@@ -323,6 +414,20 @@ class Settings(BaseSettings):
                 raise ConfigError(
                     "Refusing to start in production with placeholder DATABASE_URL."
                 )
+            if not self._resolved_api_tokens:
+                raise ConfigError(
+                    "APP_ENV=production requires API authentication: set "
+                    "API_AUTH_TOKEN (deployment-wide) and/or API_AUTH_TOKENS "
+                    "('token:owner' pairs). The platform refuses to serve an "
+                    "unauthenticated production API."
+                )
+            for token, _ in self._resolved_api_tokens:
+                for marker in PLACEHOLDER_MARKERS:
+                    if marker.lower() in token.lower():
+                        raise ConfigError(
+                            "Refusing to start in production with a placeholder "
+                            "API auth token."
+                        )
         return self
 
     # ------------------------------------------------------------------ helpers

@@ -843,6 +843,70 @@ now loop-scoped. All pre-existing suites still pass.
 
 ---
 
+## Phase 9 — Production security, monitoring, reliability & deployment readiness
+
+Phase 9 hardens the platform for real deployments **without changing any
+analysis behaviour**: no new trading capability, no Phase 10 work, no
+automatic execution. The full audit (findings, severity, evidence) lives in
+`docs/security-audit-phase9.md`; the runbook in `docs/operations.md`.
+
+What was added / changed (all enforced by tests):
+
+* **Real API authentication (opt-in locally, mandatory in production)** —
+  every `/api/v1` endpoint requires `Authorization: Bearer <token>` when
+  `API_AUTH_TOKEN`/`API_AUTH_TOKENS` is configured; `APP_ENV=production`
+  **refuses to start without one** (fail fast). Optional `token:owner`
+  bindings pin a request to its owner and ignore a spoofed `X-User-Id`.
+  Health endpoints stay open for infrastructure probes; local single-user
+  mode behaves exactly as before when no token is configured. Tokens live
+  only in server-side configuration, are never logged, and comparison is
+  constant-time.
+* **Log secret redaction** — every log record's payload passes a redaction
+  layer (credential-shaped keys and values) before reaching the handlers;
+  DB URLs were already masked.
+* **Security headers** — `X-Content-Type-Options`, `X-Frame-Options: DENY`,
+  `Referrer-Policy`, `Cache-Control: no-store` and a restrictive CSP on API
+  responses (backend) and on the Next.js app (frontend `next.config.ts`).
+* **Rate limit on backtest creation** — the last unthrottled
+  resource-intensive operation now uses the same per-owner sliding-window
+  limiter as research/AI (429 with honest message).
+* **Frontend type gate** — `ignoreBuildErrors: true` removed; `tsc --noEmit`
+  and the production build now fail on type errors (several latent type
+  errors fixed; a stale `ParamFieldSchema` union now mirrors the backend's
+  `boolean` param type).
+* **Container hardening** — backend and frontend images run as non-root
+  users; the frontend image gained a healthcheck; compose binds PostgreSQL
+  (and by default API/frontend) to `127.0.0.1`, waits on real health
+  conditions, and passes the auth environment through.
+* **Backup & disaster recovery** — `scripts/backup-db.sh` (pg_dump custom
+  format, retention, integrity check), `scripts/restore-db.sh` (single
+  transaction, refuses non-empty targets without `--force-overwrite`,
+  post-restore validation) and `scripts/verify-backup-restore.sh`, which was
+  **actually executed**: disposable cluster → migrate → insert → backup →
+  restore → row-by-row verification PASSED. RPO/RTO are documented as
+  operational goals, not guarantees.
+* **CI (`.github/workflows/ci.yml`)** — backend suite on real PostgreSQL
+  (migrations validated by running Alembic against an empty DB), app-factory
+  startup validation, backup/restore verification, frontend lint + type
+  check + vitest + production build, gitleaks secret scanning and pip-audit.
+  (GitHub Actions cannot be executed inside this sandbox — the workflow is
+  validated by inspection + the same commands run locally.)
+* **Repository hygiene** — a tracked `.env`, the SQLite `db/custom.db`,
+  `.zscripts/dev.pid` and 16 `tool-results/*.txt` artifacts were untracked
+  and ignored.
+* **Production operations guide** — `docs/operations.md`: prerequisites,
+  env vars, secret rotation, migration/rollback reality (restore-from-backup
+  is the supported rollback; downgrades are not guaranteed lossless), HTTPS,
+  health verification, logs, MT5/AI failure behaviour, troubleshooting,
+  resource limits and a post-deployment checklist.
+
+New/changed configuration is documented in both `.env.example` templates.
+Existing behaviour is preserved: with no tokens configured (local/test) the
+API is open exactly as in Phases 1–8, and all 731+ backend tests and 145
+frontend tests pass unchanged (plus the new Phase 9 suites).
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause & fix |
@@ -863,6 +927,7 @@ now loop-scoped. All pre-existing suites still pass.
 | `strategy_mismatch` on validate | The rule set's mode/direction disagrees with the strategy (a `both` strategy accepts any rule-set direction; a directional one does not). |
 | Publish returns `ALREADY_PUBLISHED` / `VERSION_SUPERSEDED` | That version is already the live definition, or a historical one. Save a new draft version instead. |
 | Publish returns `STRATEGY_ARCHIVED` | Unarchive the strategy first. |
+| Every API call returns 401 `UNAUTHORIZED` | API authentication is enabled but the frontend was built without the token. Rebuild with `NEXT_PUBLIC_API_TOKEN` set (see docs/operations.md). |
 | `INVALID_OWNER_ID` | The `X-User-Id` header must be 1–64 chars from `[A-Za-z0-9._@-]`. |
 | A strategy “disappeared” from the list | It (or its category) is archived. Enable “Show archived”, or `?include_archived=true` / `?status=archived`. |
 
@@ -901,7 +966,7 @@ now loop-scoped. All pre-existing suites still pass.
 9. `docker compose` builds the frontend in dev mode; the production build
    path (`Dockerfile.frontend`) was not exercised inside the sandbox.
 
-## Recommended next step: Phase 9 — candidate directions
+## Recommended next step: Phase 10 — candidate directions
 
 1. WebSocket streaming of candle updates + status changes; the frontend
    client already isolates all backend I/O in one module, and the backtest
@@ -914,6 +979,7 @@ now loop-scoped. All pre-existing suites still pass.
 3. Deeper backfill tooling for the historical candle cache (the backtest
    engine runs on whatever window the cache covers and reports coverage
    honestly; it never fetches mid-walk to stay deterministic).
-4. Optional: built-in authentication replacing the `X-User-Id` scoping.
+4. Optional: per-user account system with sessions/revocation on top of the
+   Phase 9 bearer-token layer (for multi-tenant internet-facing deployments).
 5. Optional: a calibration methodology IF confidence scores are ever
    requested — never before it exists.

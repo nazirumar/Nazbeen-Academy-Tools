@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.core.ownership import current_owner
+from app.core.rate_limit import check_rate_limit
 from app.core.responses import created, ok
 from app.db.session import get_db_session
 from app.domains.backtest import csv_export
@@ -99,6 +100,12 @@ async def create_backtest(
     execution architecture.
     """
 
+    # Phase 9: per-owner creation rate limit (same mechanism as the AI layer
+    # and research-run creation). Each accepted creation starts a bounded
+    # in-process run, so one client must not be able to flood the runner.
+    check_rate_limit(
+        f"backtest-create:{owner}", settings.backtest_max_creates_per_minute
+    )
     run = await backtest_service.validate_and_create(session, owner, settings, payload)
     # Commit before scheduling so the runner (own session) sees the row.
     await session.commit()

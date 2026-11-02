@@ -16,7 +16,11 @@ const okEnvelope = (data: unknown) => ({
   meta: { request_id: "abc123", timestamp: "2026-01-01T00:00:00Z", api_version: "v1" },
 });
 
-const errEnvelope = (code: string, message: string, details = []) => ({
+const errEnvelope = (
+  code: string,
+  message: string,
+  details: unknown[] = [],
+) => ({
   success: false,
   data: null,
   error: { code, message, details },
@@ -104,5 +108,56 @@ describe("api client envelope handling", () => {
     await expect(api.get("/api/v1/strategies/xyz")).rejects.toMatchObject({
       code: "NOT_FOUND",
     });
+  });
+
+  it("sends no Authorization header when NEXT_PUBLIC_API_TOKEN is unset", async () => {
+    const prevToken = process.env.NEXT_PUBLIC_API_TOKEN;
+    delete process.env.NEXT_PUBLIC_API_TOKEN;
+    vi.resetModules();
+    try {
+      const { api: freshApi } = await import("@/lib/api/client");
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+        envelopeResponse(okEnvelope({}))
+      );
+      await freshApi.get("/api/v1/meta");
+      const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+        .calls[0] as [string, RequestInit];
+      const headers = (init.headers ?? {}) as Record<string, string>;
+      expect(headers["Authorization"]).toBeUndefined();
+    } finally {
+      process.env.NEXT_PUBLIC_API_TOKEN = prevToken;
+      vi.resetModules();
+    }
+  });
+
+  it("sends Authorization: Bearer <token> when NEXT_PUBLIC_API_TOKEN is set", async () => {
+    const prevToken = process.env.NEXT_PUBLIC_API_TOKEN;
+    process.env.NEXT_PUBLIC_API_TOKEN = "test-access-token-123456";
+    vi.resetModules();
+    try {
+      const { api: freshApi } = await import("@/lib/api/client");
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+        envelopeResponse(okEnvelope({}))
+      );
+      await freshApi.get("/api/v1/meta");
+      const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+        .calls[0] as [string, RequestInit];
+      const headers = (init.headers ?? {}) as Record<string, string>;
+      expect(headers["Authorization"]).toBe("Bearer test-access-token-123456");
+      // POST bodies keep the JSON content type next to the auth header.
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mockClear();
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+        envelopeResponse(okEnvelope({}), 201)
+      );
+      await freshApi.post("/api/v1/strategy-categories", { name: "x" });
+      const [, postInit] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+        .calls[0] as [string, RequestInit];
+      const postHeaders = (postInit.headers ?? {}) as Record<string, string>;
+      expect(postHeaders["Authorization"]).toBe("Bearer test-access-token-123456");
+      expect(postHeaders["Content-Type"]).toBe("application/json");
+    } finally {
+      process.env.NEXT_PUBLIC_API_TOKEN = prevToken;
+      vi.resetModules();
+    }
   });
 });

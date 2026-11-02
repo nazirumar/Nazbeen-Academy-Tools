@@ -2,7 +2,10 @@ services:
   # ---------------------------------------------------------------------------
   # PostgreSQL 16 — the only database of the platform.
   # Credentials come from the .env file next to this compose file
-  # (see .env.example). CHANGE THE PASSWORD before any non-local use.
+  # (see .env.example). CHANGE THE PASSWORD before any non-local use — the
+  # backend refuses placeholder credentials when APP_ENV=production.
+  # The port is bound to 127.0.0.1 by default (Phase 9): the database must
+  # never be reachable from other hosts unless an operator explicitly opts in.
   # ---------------------------------------------------------------------------
   db:
     image: postgres:16-alpine
@@ -12,7 +15,7 @@ services:
       POSTGRES_PASSWORD: ${TA_DB_PASSWORD:-CHANGE_ME_strong_password}
       POSTGRES_DB: ${TA_DB_NAME:-ta_platform}
     ports:
-      - "5432:5432"
+      - "${TA_DB_HOST:-127.0.0.1}:5432:5432"
     volumes:
       - ta_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -23,6 +26,8 @@ services:
 
   # ---------------------------------------------------------------------------
   # FastAPI backend — applies migrations on start, then serves on :8000.
+  # Phase 9: API authentication envs are passed through. APP_ENV=production
+  # requires API_AUTH_TOKEN and/or API_AUTH_TOKENS (fail-fast at startup).
   # ---------------------------------------------------------------------------
   backend:
     build:
@@ -35,6 +40,9 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-json}
+      # Phase 9 API authentication (bearer tokens; see docs/operations.md).
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
+      API_AUTH_TOKENS: ${API_AUTH_TOKENS:-}
       MARKET_DATA_PROVIDER: mt5
       # The MetaTrader5 package cannot run inside Linux containers: the
       # backend starts in the honest "disabled" mode here. For live MT5 data
@@ -49,13 +57,14 @@ services:
       AI_API_KEY: ${AI_API_KEY:-}
       AI_RATE_LIMIT_PER_MINUTE: ${AI_RATE_LIMIT_PER_MINUTE:-10}
     ports:
-      - "8000:8000"
+      - "${TA_API_HOST:-127.0.0.1}:8000:8000"
     depends_on:
       db:
         condition: service_healthy
 
   # ---------------------------------------------------------------------------
   # Next.js frontend — standalone build, talks to the backend directly.
+  # Waits for the backend's own healthcheck (not just process start).
   # ---------------------------------------------------------------------------
   frontend:
     build:
@@ -64,12 +73,13 @@ services:
       args:
         NEXT_PUBLIC_BACKEND_ORIGIN: ${NEXT_PUBLIC_BACKEND_ORIGIN:-http://localhost:8000}
         NEXT_PUBLIC_BACKEND_PORT: "8000"
+        NEXT_PUBLIC_API_TOKEN: ${NEXT_PUBLIC_API_TOKEN:-}
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "${TA_FRONTEND_HOST:-127.0.0.1}:3000:3000"
     depends_on:
       backend:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   ta_pgdata:

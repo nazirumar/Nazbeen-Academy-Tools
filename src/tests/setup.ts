@@ -40,6 +40,5 @@ if (typeof window !== "undefined" && !("ResizeObserver" in window)) {
     unobserve() {}
     disconnect() {}
   }
-  (window as unknown as { ResizeObserver: typeof ResizeObserverStub }).ResizeObserver =
-    ResizeObserverStub as unknown as typeof window.ResizeObserver;
+  (window as unknown as Record<string, unknown>).ResizeObserver = ResizeObserverStub;
 }

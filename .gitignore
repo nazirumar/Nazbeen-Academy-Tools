@@ -68,3 +68,17 @@ htmlcov/
 # env files are already ignored above (.env*); keep the templates trackable:
 !.env.example
 !backend/.env.example
+
+# =============================================================================
+# Phase 9 — never commit local data, secrets or tool artifacts
+# =============================================================================
+*.db
+db/*.db
+/tool-results/
+.zscripts/dev.pid
+.env
+!.env.example
+!backend/.env.example
+
+# Phase 9: local DB dumps contain user data — never commit
+/backups/

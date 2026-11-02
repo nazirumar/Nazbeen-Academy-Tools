@@ -128,6 +128,7 @@ const conversationsPage: PaginatedAIConversations = {
       title: "Condition research",
       analysis_id: "aaaaaaaa-1111-1111-1111-111111111111",
       backtest_id: null,
+      research_id: null,
       message_count: 2,
       last_message_at: "2026-01-01T01:05:00.000+00:00",
       created_at: "2026-01-01T01:00:00.000+00:00",

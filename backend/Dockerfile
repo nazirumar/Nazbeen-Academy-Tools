@@ -1,5 +1,11 @@
 # TA Platform backend — production-style image (Python 3.12 slim).
 # Migrations run automatically at container start (alembic upgrade head).
+#
+# Phase 9 hardening:
+# - dependencies installed reproducibly (no cache, requirements pinned in requirements.txt)
+# - runs as a non-root user
+# - built-in liveness healthcheck (no curl needed)
+# - no secrets are copied into the image: configuration comes from env at runtime
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -16,6 +22,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY alembic.ini ./alembic.ini
 COPY alembic ./alembic
 COPY app ./app
+
+# Non-root runtime user (no shell access needed by the app).
+RUN groupadd --system ta && useradd --system --gid ta --create-home ta
+USER ta
 
 EXPOSE 8000
 
