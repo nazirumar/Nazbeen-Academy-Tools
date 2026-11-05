@@ -93,6 +93,25 @@ class TestEnvironmentConsistency:
             _settings(market_data_provider="binance")
 
 
+class TestMarketDataStartupConfig:
+    """Market-data startup behaviour and replay limits have safe defaults."""
+
+    def test_mt5_warmup_disabled_by_default(self) -> None:
+        # A wedged terminal must never block the HTTP server at startup.
+        s = _settings()
+        assert s.mt5_warmup_on_startup is False
+
+    def test_mt5_warmup_can_be_enabled(self) -> None:
+        s = _settings(mt5_warmup_on_startup=True)
+        assert s.mt5_warmup_on_startup is True
+
+    def test_replay_limits_default(self) -> None:
+        s = _settings()
+        assert s.replay_max_candles == 20_000
+        assert s.replay_max_candles_returned == 5_000
+        assert s.replay_max_creates_per_minute == 30
+
+
 class TestGetSettings:
     def test_polluted_non_postgres_env_url_is_ignored(self, monkeypatch) -> None:
         """Frontend tooling (e.g. Prisma) may export a file: DATABASE_URL —

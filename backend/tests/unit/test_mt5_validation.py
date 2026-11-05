@@ -175,6 +175,21 @@ class TestFormingVsClosed:
         assert result.server_time_skew_seconds is not None
         assert any(w.code == "SERVER_TIME_AHEAD" for w in result.warnings)
 
+    def test_broker_clock_ahead_keeps_closed_history(self) -> None:
+        # A broker server ahead of the host clock must not make every recent
+        # candle look "forming": only the newest broker slot is incomplete.
+        end_open = (NOW // 60 * 60) + 2 * 3600
+        rows = m1_series(5, end_open=end_open)
+        result = validate_candles(rows, "M1", now_epoch=NOW)
+        assert result.forming_count == 1
+        assert [c["forming"] for c in result.candles] == [False, False, False, False, True]
+        assert result.is_stale is False
+
+        closed = validate_candles(rows, "M1", now_epoch=NOW, closed_only=True)
+        assert closed.excluded_forming == 1
+        assert len(closed.candles) == 4
+        assert all(c["forming"] is False for c in closed.candles)
+
 
 class TestStaleness:
     def test_fresh_history_not_stale(self) -> None:

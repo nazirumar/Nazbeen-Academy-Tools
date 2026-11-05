@@ -59,10 +59,11 @@ Backend (see `backend/.env.example` for the full annotated template):
 | `CORS_ORIGINS` | recommended | comma-separated absolute origins (e.g. `https://app.example.com`); empty = same-origin only |
 | `LOG_LEVEL` / `LOG_FORMAT` | optional | `INFO` / `json` in production |
 | `MT5_ENABLED` | optional | `false` in Linux containers (default in compose) |
+| `MT5_WARMUP_ON_STARTUP` | optional | default `false`: do not block HTTP startup on a wedged terminal. Set `true` only on a healthy live host if you want terminal problems surfaced immediately. |
 | `MT5_LOGIN` / `MT5_PASSWORD` / `MT5_SERVER` | only if explicit login | leave empty to attach to the terminal's own login (recommended — nothing stored) |
 | `AI_ENABLED` + `AI_BASE_URL` + `AI_MODEL` + `AI_API_KEY` | only if AI on | key is server-side only, never returned/logged |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | optional | pool sizing (default 5/10) |
-| `BACKTEST_MAX_*` / `RESEARCH_MAX_*` | optional | resource limits (documented in `.env.example`) |
+| `BACKTEST_MAX_*` / `RESEARCH_MAX_*` / `REPLAY_MAX_*` | optional | resource limits (documented in `.env.example`) |
 
 Frontend build args (`Dockerfile.frontend`):
 
@@ -139,7 +140,11 @@ python -m alembic downgrade -1          # ⚠ see rollback caveats below
 
 - The container image runs `alembic upgrade head` before serving. Migrations
   are **additive only** (verified: no `DROP`/recreate of existing tables in
-  the Phase 1–8 chain) — startup never destroys data.
+  the Phase 1–11 chain). The Phase 11 revision `e2c7a91b4d30` adds only
+  `replay_sessions`; it does not alter existing tables.
+- The Phase 11 chain was verified on a clean disposable PostgreSQL database:
+  `upgrade head` → `alembic check` (no drift) → `downgrade base` → `upgrade
+  head`. See `docs/phase10-release-readiness.md`.
 - One process runs migrations at a time: scale `backend` to 1 replica, or run
   the migration step separately (`docker compose run --rm backend alembic
   upgrade head`) and then start app replicas.
@@ -225,12 +230,17 @@ DATABASE_URL="postgresql://user:pass@host:5432/ta_platform" ./scripts/backup-db.
   (`backend/.env`, compose `.env`) — keep THOSE backed up separately
   (encrypted) or recreate from your secret manager.
 
-**Restore verification status (Phase 9)**: `scripts/verify-backup-restore.sh`
-was executed successfully in this repository (2026-11-02): it creates a
-disposable cluster, migrates it, inserts sample rows, backs up, restores into
-an empty database, compares table-by-table row counts, verifies row content,
-and proves the non-empty-target refusal. It runs in CI. **Recovery of THIS
-deployment's real data has not been exercised** — schedule a drill per §16.
+**Restore verification status (Phase 9 / Phase 11)**: the backup/restore
+toolchain was executed successfully in this repository. Phase 9
+(2026-11-02) ran `scripts/verify-backup-restore.sh` on a disposable cluster
+and proved the non-empty-target refusal. Phase 11 (2026-11-05) re-ran
+`scripts/backup-db.sh` and `scripts/restore-db.sh` against disposable
+databases on a local PostgreSQL cluster, inserting sample candles and a
+`replay_sessions` row: the restored database matched table-by-table row
+counts, restored `alembic_version = e2c7a91b4d30`, and the non-empty-target
+refusal returned exit code 1. `scripts/verify-backup-restore.sh` runs in CI.
+**Recovery of THIS deployment's real data has not been exercised** — schedule
+a drill per §16.
 
 **RPO / RTO (operational goals, not guarantees)**: with daily backups the
 practical RPO is ≤ 24 h (tighten with cron frequency + WAL archiving if
@@ -263,6 +273,11 @@ reverted, prefer **restore from the pre-update backup** (§6 caveats) over
 - Terminal access is serialized on a worker thread with bounded retries and
   capped exponential backoff (never a tight reconnect loop); disconnects are
   surfaced as `STALE_DATA`/unavailable status, not fabricated candles.
+- **Startup warm-up is opt-in** (`MT5_WARMUP_ON_STARTUP=false` by default).
+  A wedged terminal can block IPC calls; keeping warm-up off ensures the HTTP
+  server still starts and reports the terminal state lazily. Candle cache
+  reads and replay continue to work offline. Set it to `true` only on a
+  healthy live Windows host if immediate connection diagnostics are wanted.
 - The platform never places orders. MT5 is a read-only data source here.
 
 ## 12. AI provider setup and failure behavior
@@ -305,7 +320,7 @@ reverted, prefer **restore from the pre-update backup** (§6 caveats) over
 | Frontend shows `BACKEND_UNREACHABLE` | Direct mode without backend reachability, or backend down. Check `NEXT_PUBLIC_BACKEND_ORIGIN`, CORS, `curl HOST:8000/health/live`. |
 | 401 `UNAUTHORIZED` from every API call | Frontend was built without `NEXT_PUBLIC_API_TOKEN` while the backend has auth enabled — rebuild the frontend with the token. |
 | 413 on save/paste | Body over `REQUEST_MAX_BODY_BYTES` (default 2 MB) — intended. |
-| 429 on backtest/research/AI | Per-owner rate limit hit — intended; wait or raise the documented setting. |
+| 429 on backtest/research/AI/replay | Per-owner rate limit hit — intended; wait or raise the documented setting. |
 | MT5 status `connected: false` in compose | Expected on Linux (no MetaTrader5 package). Run the backend natively on Windows for live data. |
 | `migrated: false` on `/health/db` | Migrations not applied: `docker compose run --rm backend alembic upgrade head`. |
 
@@ -313,17 +328,20 @@ reverted, prefer **restore from the pre-update backup** (§6 caveats) over
 
 All limits are env-tunable and documented in `backend/.env.example`:
 request body cap (`REQUEST_MAX_BODY_BYTES`), candle caps
-(`MT5_MAX_CANDLES`, `BACKTEST_MAX_CANDLES`), research computation caps
-(`RESEARCH_MAX_COMBINATIONS`, `RESEARCH_MAX_WALKS`, `RESEARCH_MAX_WINDOWS`,
-…), concurrency (`BACKTEST_MAX_CONCURRENT`, `RESEARCH_MAX_CONCURRENT`),
-creation rate limits (`BACKTEST_MAX_CREATES_PER_MINUTE`,
-`RESEARCH_MAX_CREATES_PER_MINUTE`), AI bounds (`AI_TIMEOUT_SECONDS`,
+(`MT5_MAX_CANDLES`, `BACKTEST_MAX_CANDLES`), replay caps
+(`REPLAY_MAX_CANDLES`, `REPLAY_MAX_CANDLES_RETURNED`), research computation
+caps (`RESEARCH_MAX_COMBINATIONS`, `RESEARCH_MAX_WALKS`,
+`RESEARCH_MAX_WINDOWS`, …), concurrency (`BACKTEST_MAX_CONCURRENT`,
+`RESEARCH_MAX_CONCURRENT`), creation rate limits
+(`BACKTEST_MAX_CREATES_PER_MINUTE`, `RESEARCH_MAX_CREATES_PER_MINUTE`,
+`REPLAY_MAX_CREATES_PER_MINUTE`), AI bounds (`AI_TIMEOUT_SECONDS`,
 `AI_MAX_RETRIES`, `AI_RATE_LIMIT_PER_MINUTE`, `AI_MAX_INPUT_CHARS`,
 `AI_MAX_OUTPUT_TOKENS`). DB pool: `DB_POOL_SIZE`/`DB_MAX_OVERFLOW`
 (guideline: pool ≈ expected concurrent request handlers; workers and web
 share the same single-process engine in the documented architecture).
-Large list endpoints are paginated (page_size ≤ 100); backtests/research
-never load unbounded history (candle caps + coverage checks).
+Large list endpoints are paginated (page_size ≤ 100); backtests, research and
+replay never load unbounded history (candle caps + coverage checks). Replay
+also caps each chart response and each creation request per owner.
 
 ## 16. Post-deployment verification checklist
 
@@ -337,12 +355,15 @@ never load unbounded history (candle caps + coverage checks).
    (`curl -sI https://your-domain | grep -i content-security`).
 6. Create a category + strategy through the UI; run an analysis — data
    round-trips (DB writable, ownership scoping intact).
-7. `/docs` NOT reachable in production (disabled by default).
-8. Logs show `application_started` with `auth: {"enabled": true, …}` and no
+7. Replay smoke test: open the Replay tab, check stored coverage, create a
+   session, step once, reload the page and confirm the cursor resumes. The
+   chart must never show a candle after the persisted cursor.
+8. `/docs` NOT reachable in production (disabled by default).
+9. Logs show `application_started` with `auth: {"enabled": true, …}` and no
    secrets anywhere in the log stream.
-9. Backup scheduled (`cron`/systemd timer running `scripts/backup-db.sh`),
-   first dump verified with `pg_restore --list`.
-10. MT5 (if used): status panel shows real `connected` state matching the
+10. Backup scheduled (`cron`/systemd timer running `scripts/backup-db.sh`),
+    first dump verified with `pg_restore --list`.
+11. MT5 (if used): status panel shows real `connected` state matching the
     terminal; AI (if used): one chat exchange succeeds; disable flags
     otherwise.
 

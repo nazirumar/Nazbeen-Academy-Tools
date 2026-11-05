@@ -5,4 +5,4 @@ management, rule-format validation, explainable evaluation core).
 """
 
 __app_name__ = "TA Platform API"
-__version__ = "0.1.0"
+__version__ = "0.2.1"

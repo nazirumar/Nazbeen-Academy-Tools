@@ -116,6 +116,11 @@ class MT5Provider:
         # adapter singleton may predate a configuration change.
         payload["provider"] = self.name
         payload["enabled"] = self.settings.mt5_enabled
+        if not self.settings.mt5_enabled:
+            # A stale adapter singleton may still hold a previous connection
+            # (tests, or an operator toggling config). Configuration wins:
+            # a disabled integration is never reported as connected/live.
+            payload["connected"] = False
         payload["configuration"] = self.settings.mt5_config_summary()
         return payload
 
@@ -209,7 +214,12 @@ class MT5Provider:
                 )
 
                 state = await series_state(session, symbol, timeframe)
-                if not state or state["cached_rows"] < limit:
+                # Load one extra row when closed-only: the newest row may be
+                # forming. Recompute the closed/forming state from timestamps
+                # instead of trusting cached is_closed flags, which may predate
+                # a broker-clock-skew correction.
+                rows_needed = limit + 1 if closed_only else limit
+                if not state or state["cached_rows"] < rows_needed:
                     return None
                 if not is_series_fresh(
                     state,
@@ -218,7 +228,7 @@ class MT5Provider:
                 ):
                     return None
                 candles = await load_candles(
-                    session, symbol, timeframe, limit, closed_only=closed_only
+                    session, symbol, timeframe, rows_needed, closed_only=False
                 )
         except Exception as exc:  # noqa: BLE001 - cache is an optimization
             logger.warning(

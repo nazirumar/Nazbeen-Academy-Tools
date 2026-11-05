@@ -43,11 +43,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         get_provider(settings)
         init_engine(settings)
 
-        # Warm up the MT5 connection in the background (bounded, never blocks
-        # startup): the adapter connects lazily anyway, but an early check
-        # surfaces terminal problems in the status endpoints immediately.
+        # Warm up the MT5 connection in the background only when explicitly
+        # enabled. The adapter connects lazily anyway; a wedged terminal must
+        # never block the HTTP server during startup.
         warmup_task: asyncio.Task | None = None
-        if settings.mt5_enabled:
+        if settings.mt5_enabled and settings.mt5_warmup_on_startup:
             from app.domains.market_data.mt5_adapter import get_mt5_adapter
 
             adapter = get_mt5_adapter(settings)

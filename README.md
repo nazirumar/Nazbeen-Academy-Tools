@@ -471,6 +471,7 @@ The frontend calls the backend through one of two modes
 | `MT5_CACHE_ENABLED` | `true` | PostgreSQL historical candle cache. |
 | `MT5_CACHE_MAX_AGE_SECONDS` | `90` | Serve-from-cache freshness bound (per-timeframe grace applies). |
 | `MT5_STALE_AFTER_INTERVALS` | `3` | Closed candles older than N intervals (plus weekend allowance) are flagged `STALE_DATA`. |
+| `MT5_WARMUP_ON_STARTUP` | `false` | Opt-in terminal warm-up at startup. Left off so a wedged terminal cannot make the HTTP server unresponsive; candle sync and lazy connection still work. |
 | **AI research layer (Phase 7, optional)** | | |
 | `AI_ENABLED` | `false` | Master switch. `true` requires `AI_BASE_URL`, `AI_MODEL` and `AI_API_KEY` (fail-fast otherwise). The deterministic platform is fully usable without it. |
 | `AI_BASE_URL` / `AI_MODEL` | empty | Any OpenAI-compatible chat-completions endpoint + model name. No specific model is assumed to exist. |
@@ -501,7 +502,7 @@ Migration URLs resolve from `ALEMBIC_DATABASE_URL` (override) or the app's
 `DATABASE_URL`. Migrations in this repo:
 
 1. `9c7783174bf9` — `strategy_categories`, `strategies`, `strategy_versions`
-   (JSONB rule sets, CHECK constraints, immutable `(strategy_id, version)`.
+   (JSONB rule sets, CHECK constraints, immutable `(strategy_id, version)`).
 2. `c5f21a0b93d2` — `candles` cache table: composite PK
    `(symbol, timeframe, open_time)` (duplicate inserts impossible at the DB
    level), positive-price & `high >= low` CHECK constraints, newest-first
@@ -519,18 +520,26 @@ Migration URLs resolve from `ALEMBIC_DATABASE_URL` (override) or the app's
    validated per access) and auditable messages storing the exact
    minimized context each answer was built from, plus its validation
    summary. The AI layer writes ONLY these rows.
+7. `c9a1e5d7b324` — Phase 8 research optimization: runs, candidates,
+   walk-forward windows and robustness scenarios with full configuration
+   snapshots and owner-scoped indexes.
+8. `e2c7a91b4d30` — Phase 11 historical replay: `replay_sessions`, a saved
+   deterministic cursor over the existing candle cache (requested/resolved
+   window, quality snapshot, cursor and visibility counters). No candle rows
+   are duplicated and no execution/journal table is added.
 
 ## Testing
 
 ```bash
-# Backend — 627 tests: unit (faked MetaTrader5, no terminal needed) +
-# integration on a REAL PostgreSQL server (pgserver provisions an isolated
-# cluster automatically; integration tests skip with a clear message if
-# pgserver is unavailable). External LLM providers are ALWAYS scripted
-# fakes — no network, no paid API calls.
+# Backend — current checkout: 786 passed, 3 skipped. Unit tests use a faked
+# MetaTrader5 (no terminal needed); integration tests use a REAL PostgreSQL
+# server. External LLM providers are ALWAYS scripted fakes — no network, no
+# paid API calls. On Windows (no pgserver wheel) set TA_TEST_DATABASE_URL to
+# a disposable PostgreSQL database whose name contains "test".
 cd backend && python3 -m pytest tests/ -q
 
-# Frontend — 127 tests (vitest + Testing Library)
+# Frontend — current checkout: 153 tests across 14 files (vitest + Testing
+# Library). Includes the replay workspace/playback tests.
 bun run test          # or: bunx vitest
 bun run lint          # ESLint
 ```
@@ -902,8 +911,67 @@ What was added / changed (all enforced by tests):
 
 New/changed configuration is documented in both `.env.example` templates.
 Existing behaviour is preserved: with no tokens configured (local/test) the
-API is open exactly as in Phases 1–8, and all 731+ backend tests and 145
-frontend tests pass unchanged (plus the new Phase 9 suites).
+API is open exactly as in Phases 1–8. The current suites remain green
+(786 backend tests passed, 3 skipped; 153 frontend tests passed).
+
+---
+
+## Phase 11 — Historical market replay (first vertical slice)
+
+The **Replay** tab walks stored PostgreSQL candles candle-by-candle through a
+persisted, deterministic server-side cursor. It is an original implementation
+built on the platform's own candle cache and data-quality helpers; no
+third-party replay product code, branding or assets were used.
+
+What is implemented:
+
+* **Saved sessions** — owner-scoped (`X-User-Id`) history with symbol,
+  timeframe, requested window, status, visible/total counts, progress,
+  data-quality badge and creation time. Reloading the page resumes at the
+  saved cursor.
+* **Deterministic no-look-ahead playback** — creation resolves only closed,
+  valid, deduplicated candles. The chart endpoint returns only candles with
+  `open_time <= cursor_time`; `step` loads only rows strictly after the
+  cursor. A defensive `REPLAY_LOOKAHEAD_GUARD` rejects any future candle.
+* **Honest data quality** — forming rows and invalid OHLC rows are excluded
+  and counted; duplicates are removed once and reported; gaps are reported,
+  never filled. The quality snapshot is persisted with the session.
+* **Lifecycle** — create (paused at the first candle), step (1–100), seek,
+  play/pause, reset, speed and delete. Step is allowed while paused for
+  single-bar inspection. Completion is explicit; resume-after-end returns
+  `409 REPLAY_AT_END`.
+* **Presentation-only speed** — the backend accepts `0 < speed <= 60`; the
+  UI offers 0.5× through 30×. Speed changes the delay between server steps,
+  never chronology or future fills.
+* **Offline-first** — replay never fetches live MT5 data while playing. It
+  reads the existing PostgreSQL candle cache; missing history is an honest
+  422 (`NO_HISTORICAL_DATA`), never a fabricated candle.
+
+API (owner-scoped, standard envelope; full contract in
+[`docs/replay.md`](docs/replay.md)):
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/v1/replay/data-coverage` | Read-only stored-candle coverage check. |
+| POST | `/api/v1/replay/sessions` | Create a paused session (rate-limited). |
+| GET | `/api/v1/replay/sessions` | Paginated saved-session history. |
+| GET | `/api/v1/replay/sessions/{id}` | Saved cursor, progress and quality. |
+| GET | `/api/v1/replay/sessions/{id}/candles` | Newest visible candles, bounded by the cursor. |
+| POST | `/api/v1/replay/sessions/{id}/step` | Advance closed candles. |
+| POST | `/api/v1/replay/sessions/{id}/seek` | Jump to the latest candle at/before a time. |
+| POST | `/api/v1/replay/sessions/{id}/resume` \| `/pause` \| `/reset` | Presentation lifecycle. |
+| PATCH | `/api/v1/replay/sessions/{id}` | Presentation speed. |
+| DELETE | `/api/v1/replay/sessions/{id}` | Delete this owner's session. |
+
+Settings: `REPLAY_MAX_CANDLES=20000` (session window cap),
+`REPLAY_MAX_CANDLES_RETURNED=5000` (chart response cap) and
+`REPLAY_MAX_CREATES_PER_MINUTE=30`. Binary Options replay is M1-only.
+
+**Not in this slice** (deferred, not silently implied): simulated replay
+orders/fills/exits/P&L, the replay trade journal, CSV dataset import and
+provenance workflows, shared interactive execution with the backtest engine,
+multi-timeframe replay, strategy evaluation during playback, streaming and
+automatic session retention. See `docs/replay.md` for the complete list.
 
 ---
 
@@ -966,20 +1034,29 @@ frontend tests pass unchanged (plus the new Phase 9 suites).
 9. `docker compose` builds the frontend in dev mode; the production build
    path (`Dockerfile.frontend`) was not exercised inside the sandbox.
 
-## Recommended next step: Phase 10 — candidate directions
+## Recommended next steps (after Phase 10/11)
 
-1. WebSocket streaming of candle updates + status changes; the frontend
+Phase 10 release-readiness evidence and the remaining gaps are recorded in
+[`docs/phase10-release-readiness.md`](docs/phase10-release-readiness.md).
+Replay's implemented scope and deferred items are in
+[`docs/replay.md`](docs/replay.md).
+
+1. Complete the replay feature set in explicit slices: simulated
+   orders/fills/exits, a trade journal, then CSV dataset import with
+   provenance. Reuse the Phase 6 execution primitives rather than creating a
+   second simulation engine.
+2. WebSocket streaming of candle updates + status changes; the frontend
    client already isolates all backend I/O in one module, and the backtest
    runner exposes the same status lifecycle that a push channel would need.
-2. Advance the remaining planned rule types (order blocks, breaker blocks,
+3. Advance the remaining planned rule types (order blocks, breaker blocks,
    S/R reactions) from registry entries to operational, tested evaluators —
    Phase 4's promotions document the exact recipe (spec + evaluator + tests);
    each new evaluator immediately becomes backtestable with zero engine
    changes.
-3. Deeper backfill tooling for the historical candle cache (the backtest
-   engine runs on whatever window the cache covers and reports coverage
-   honestly; it never fetches mid-walk to stay deterministic).
-4. Optional: per-user account system with sessions/revocation on top of the
+4. Deeper backfill tooling for the historical candle cache (the backtest and
+   replay engines run on whatever window the cache covers and report coverage
+   honestly; they never fetch mid-walk to stay deterministic).
+5. Optional: per-user account system with sessions/revocation on top of the
    Phase 9 bearer-token layer (for multi-tenant internet-facing deployments).
-5. Optional: a calibration methodology IF confidence scores are ever
+6. Optional: a calibration methodology IF confidence scores are ever
    requested — never before it exists.

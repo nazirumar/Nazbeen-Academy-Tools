@@ -140,7 +140,8 @@ class BacktestResult(Base, TimestampMixin):
         UUID(as_uuid=True),
         ForeignKey("backtest_runs.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
+        # ``ix_backtest_results_run_seq`` already leads with run_id; a separate
+        # single-column index would be redundant.
     )
     owner_id: Mapped[str] = mapped_column(String(64), nullable=False)
 

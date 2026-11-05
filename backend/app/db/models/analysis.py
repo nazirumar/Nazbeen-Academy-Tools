@@ -21,7 +21,15 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, UUID
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UUID,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -51,6 +59,9 @@ class AnalysisReport(Base, TimestampMixin):
             "'invalidated', 'insufficient_data', 'inconclusive', "
             "'regime_mismatch')",
             name="valid_setup_status",
+        ),
+        Index(
+            "ix_analysis_reports_owner_created_at", "owner_id", "created_at"
         ),
     )
 

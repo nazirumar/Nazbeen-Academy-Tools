@@ -19,6 +19,9 @@ class TestLiveness:
 
 
 class TestReadiness:
+    @pytest.mark.parametrize(
+        "app_client", [{"MT5_ENABLED": "false"}], indirect=True
+    )
     async def test_ready_with_migrated_db(self, app_client) -> None:
         res = await app_client.get("/health/ready")
         assert res.status_code == 200
@@ -29,7 +32,11 @@ class TestReadiness:
         md = data["checks"]["market_data"]
         assert md["connected"] is False
         assert md["blocks_readiness"] is False
-        assert "Phase 2" in md["detail"] or "MetaTrader" in md["detail"]
+        assert (
+            "Phase 2" in md["detail"]
+            or "MetaTrader" in md["detail"]
+            or "disabled" in md["detail"]
+        )
 
     async def test_db_probe_reports_migration_state(self, app_client) -> None:
         res = await app_client.get("/health/db")

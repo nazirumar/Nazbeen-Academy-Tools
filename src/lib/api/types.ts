@@ -1456,6 +1456,126 @@ export interface ResearchParameterSchema {
   note: string;
 }
 
+// --------------------------------------------------------------------------- //
+// Phase 11: historical market replay
+// --------------------------------------------------------------------------- //
+
+export type ReplaySessionStatus = "active" | "paused" | "completed";
+
+export interface ReplayDataQuality {
+  timeframe: string;
+  candles_available: number;
+  candles_available_raw?: number;
+  expected_candles: number | null;
+  first_time: number | null;
+  last_time: number | null;
+  gap_count: number;
+  largest_gap_intervals: number;
+  duplicate_count: number;
+  out_of_order_count: number;
+  forming_count: number;
+  invalid_ohlc_count: number;
+  coverage_ratio: number | null;
+  warnings: DataQualityWarning[];
+  overall_status: "ok" | "partial";
+  closed_candles_only: boolean;
+  forming_candles_used: boolean;
+  source: string;
+  source_note: string;
+  note: string;
+}
+
+export interface ReplaySession {
+  id: string;
+  owner_id: string;
+  mode: PlatformMode;
+  symbol: string;
+  timeframe: string;
+  status: ReplaySessionStatus;
+  start_time: string;
+  end_time: string;
+  first_candle_time: string;
+  last_candle_time: string;
+  cursor_time: string;
+  current_time: string;
+  current_time_unix: number;
+  visible_candles: number;
+  total_candles: number;
+  remaining_candles: number;
+  cursor_index: number;
+  progress: number;
+  progress_pct: number;
+  at_end: boolean;
+  playback_speed: number;
+  data_quality: ReplayDataQuality;
+  config: Record<string, unknown>;
+  session_schema_version: string;
+  engine_version: string;
+  created_at: string;
+  last_advanced_at: string | null;
+  no_lookahead: true;
+  note: string;
+}
+
+export interface ReplaySessionListItem {
+  id: string;
+  mode: PlatformMode;
+  symbol: string;
+  timeframe: string;
+  status: ReplaySessionStatus;
+  start_time: string;
+  end_time: string;
+  cursor_time: string;
+  visible_candles: number;
+  total_candles: number;
+  progress: number;
+  playback_speed: number;
+  data_quality_status: string | null;
+  created_at: string;
+}
+
+export interface PaginatedReplaySessions {
+  items: ReplaySessionListItem[];
+  page: PageMeta;
+}
+
+export interface ReplayCandleSeries {
+  session_id: string;
+  symbol: string;
+  timeframe: string;
+  status: ReplaySessionStatus;
+  timezone: string;
+  candles: CandlePoint[];
+  count: number;
+  cursor_time: string;
+  current_time: string;
+  current_time_unix: number;
+  visible_candles: number;
+  total_candles: number;
+  progress: number;
+  data_quality: ReplayDataQuality;
+  no_lookahead: true;
+  future_candles_excluded: true;
+  note: string;
+  requested_limit: number;
+  returned_limit: number;
+}
+
+export interface ReplayCoverage {
+  symbol: string;
+  timeframe: string;
+  start: string;
+  end: string;
+  candles_in_range: number;
+  expected_candles: number | null;
+  coverage_ratio: number | null;
+  first_time: number | null;
+  last_time: number | null;
+  data_quality: ReplayDataQuality;
+  checked_at: string;
+  note: string;
+}
+
 export interface OOSAggregate {
   windows_aggregated: number;
   windows_with_trades: number;

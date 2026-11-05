@@ -82,3 +82,8 @@ db/*.db
 
 # Phase 9: local DB dumps contain user data — never commit
 /backups/
+
+# Playwright browser-test artifacts (never commit run output)
+/test-results/
+/playwright-report/
+/blob-report/

@@ -15,7 +15,16 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Double, SmallInteger, String
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Double,
+    Index,
+    SmallInteger,
+    String,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -30,6 +39,14 @@ class CandleRow(Base):
     __table_args__ = (
         CheckConstraint("open > 0 AND high > 0 AND low > 0 AND close > 0", name="positive_prices"),
         CheckConstraint("high >= low", name="high_gte_low"),
+        # DESC ordering matches the hot read path (latest N candles per series).
+        Index(
+            "ix_candles_series_open_time_desc",
+            "symbol",
+            "timeframe",
+            text("open_time DESC"),
+        ),
+        Index("ix_candles_open_time", "open_time"),
     )
 
     symbol: Mapped[str] = mapped_column(String(40), primary_key=True)

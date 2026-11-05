@@ -8,6 +8,11 @@ from app.db.models.backtest import (
     BacktestRun,
 )
 from app.db.models.candle import CandleRow
+from app.db.models.replay import (
+    REPLAY_SCHEMA_VERSION,
+    REPLAY_STATUSES,
+    ReplaySession,
+)
 from app.db.models.research import (
     RESEARCH_SCHEMA_VERSION,
     ResearchCandidate,
@@ -34,6 +39,7 @@ __all__ = [
     "BacktestResult",
     "BacktestRun",
     "CandleRow",
+    "ReplaySession",
     "ResearchCandidate",
     "ResearchRun",
     "ResearchScenario",
@@ -48,5 +54,7 @@ __all__ = [
     "DIRECTIONS",
     "REPORT_SCHEMA_VERSION",
     "BACKTEST_SCHEMA_VERSION",
+    "REPLAY_SCHEMA_VERSION",
+    "REPLAY_STATUSES",
     "RESEARCH_SCHEMA_VERSION",
 ]

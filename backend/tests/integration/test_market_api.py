@@ -81,6 +81,11 @@ class TestMT5StatusEndpoint:
         get_settings.cache_clear()
         monkeypatch.setattr(adapter_module, "load_mt5_module", lambda: None)
         monkeypatch.setattr(adapter_module, "_adapter", None)
+        # The real package is installed on some Windows dev hosts; simulate
+        # its absence explicitly so this test asserts the package-missing path.
+        monkeypatch.setattr(
+            adapter_module.MT5Adapter, "_probe_package", lambda self: False
+        )
         res = await app_client.get("/api/v1/mt5/status")
         assert res.status_code == 200
         data = candles_payload(res)

@@ -258,11 +258,11 @@ def validate_candles(
         )
 
     # ---- 4. forming vs closed ----------------------------------------------------
-    for row in clean:
-        row["forming"] = (row["time"] + interval) > now
-    forming_rows = [row for row in clean if row["forming"]]
-    result.forming_count = len(forming_rows)
-
+    # MT5 timestamps are broker-server time, not host-clock time. A broker
+    # server may legitimately run ahead of the host (common for FX brokers).
+    # The newest candle defines the current broker slot, so shift "now" forward
+    # by the positive skew only. Never shift backward: an old series must still
+    # surface as stale rather than being made to look current.
     newest = clean[-1]
     expected_open = _expected_open_for(now, interval)
     if newest["time"] > expected_open:
@@ -273,11 +273,19 @@ def validate_candles(
                 SEVERITY_WARNING,
                 "The newest candle opens in the future relative to this "
                 f"server's clock by ~{int(result.server_time_skew_seconds)}s. "
-                "This indicates broker-server/local-clock skew — the forming "
-                "candle is flagged accordingly and staleness uses server "
-                "timestamps only.",
+                "This indicates broker-server/local-clock skew — forming and "
+                "staleness are assessed against the broker-server clock "
+                "inferred from the newest candle.",
             )
         )
+    effective_now = now + max(0.0, float(newest["time"] - expected_open))
+
+    for row in clean:
+        if "forming" not in row:
+            row["forming"] = (row["time"] + interval) > effective_now
+    forming_rows = [row for row in clean if row["forming"]]
+    result.forming_count = len(forming_rows)
+
     if forming_rows and not closed_only:
         result.warnings.append(
             QualityWarning(
@@ -331,7 +339,7 @@ def validate_candles(
     closed_rows = [row for row in clean if not row["forming"]]
     if closed_rows:
         newest_closed = closed_rows[-1]
-        age = now - (newest_closed["time"] + interval)
+        age = effective_now - (newest_closed["time"] + interval)
         result.newest_closed_age_seconds = max(age, 0.0)
         allowed = (
             stale_after_intervals * interval

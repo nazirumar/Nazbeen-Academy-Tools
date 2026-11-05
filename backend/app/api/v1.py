@@ -20,6 +20,7 @@ from app.domains.analysis.router import router as analysis_router
 from app.domains.backtest.router import router as backtest_router
 from app.domains.market_data.router import market_router, mt5_router
 from app.domains.market_data.router import router as market_data_router
+from app.domains.replay.router import router as replay_router
 from app.domains.research.router import router as research_router
 from app.domains.market_data.timeframes import (
     MODE_TIMEFRAME_PROFILES,
@@ -46,6 +47,7 @@ api_v1_router.include_router(market_router)
 api_v1_router.include_router(strategies_router)
 api_v1_router.include_router(analysis_router)
 api_v1_router.include_router(backtest_router)
+api_v1_router.include_router(replay_router)
 api_v1_router.include_router(research_router)
 api_v1_router.include_router(ai_router)
 

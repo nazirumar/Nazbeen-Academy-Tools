@@ -222,6 +222,9 @@ class TestEvaluateStoredStrategy:
 
 
 class TestMarketDataUnavailable:
+    @pytest.mark.parametrize(
+        "app_client", [{"MT5_ENABLED": "false"}], indirect=True
+    )
     async def test_candles_request_refused_honestly(self, app_client) -> None:
         """The provider refuses data requests instead of fabricating candles."""
         from app.core.errors import MarketDataUnavailableError
@@ -238,6 +241,9 @@ class TestMarketDataUnavailable:
             or "disabled" in message
         )
 
+    @pytest.mark.parametrize(
+        "app_client", [{"MT5_ENABLED": "false"}], indirect=True
+    )
     async def test_status_endpoint(self, app_client) -> None:
         res = await app_client.get("/api/v1/market-data/status")
         assert res.status_code == 200
@@ -245,4 +251,4 @@ class TestMarketDataUnavailable:
         assert data["provider"] == "mt5"
         assert data["connected"] is False
         assert data["live_data_enabled"] is False
-        assert "Phase 2" in data["detail"] or "not installed" in data["detail"]
+        assert "Phase 2" in data["detail"] or "not installed" in data["detail"] or "disabled" in data["detail"]

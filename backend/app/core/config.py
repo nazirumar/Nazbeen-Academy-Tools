@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     # --- Application identity -------------------------------------------------
     app_name: str = "TA Platform API"
     app_env: AppEnv = "local"
-    app_version: str = "0.1.0"
+    app_version: str = "0.2.1"
     debug: bool = False
 
     # --- HTTP server -----------------------------------------------------------
@@ -118,6 +118,11 @@ class Settings(BaseSettings):
     # Closed candles older than N intervals (plus a market-closure grace for
     # D1/weekends) are reported as STALE_DATA.
     mt5_stale_after_intervals: float = Field(default=3.0, gt=0, le=1000)
+    # Warm up the terminal during API startup. Off by default: a wedged
+    # terminal (IPC timeout) must never make the HTTP server unresponsive.
+    # The adapter still connects lazily on the first live market-data request,
+    # and cache-backed historical data needs no terminal call at all.
+    mt5_warmup_on_startup: bool = False
 
     # --- Backtesting (Phase 6) ------------------------------------------------------
     # Hard cap on primary-timeframe candles per backtest run (walk length).
@@ -160,6 +165,17 @@ class Settings(BaseSettings):
     # in-process run; the cap stops accidental floods. Read/cancel
     # endpoints are not throttled (cheap, owner-scoped queries).
     research_max_creates_per_minute: int = Field(default=10, ge=1, le=10_000)
+
+    # --- Market replay (Phase 11) ---------------------------------------------------
+    # Hard cap on visible-primary-timeframe candles in one replay session. The
+    # session is a deterministic walk over stored closed candles; it never
+    # loads live data or invents missing candles.
+    replay_max_candles: int = Field(default=20_000, ge=100, le=200_000)
+    # Maximum number of candles returned by one chart request.
+    replay_max_candles_returned: int = Field(default=5_000, ge=50, le=20_000)
+    # Per-owner cap on NEW replay sessions per minute (same in-process limiter
+    # as backtests/research; read/control endpoints are not throttled).
+    replay_max_creates_per_minute: int = Field(default=30, ge=1, le=10_000)
 
     # --- AI research layer (Phase 7) -------------------------------------------------
     # The AI layer EXPLAINS existing deterministic analysis results; it never

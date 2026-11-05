@@ -506,7 +506,9 @@ describe("ResearchRunDetail", () => {
     });
     render(<ResearchRunDetail runId="run-1" onBack={() => {}} />);
     await waitFor(() => expect(screen.getByTestId("research-run-detail")).toBeInTheDocument());
-    expect(screen.getByText("px.params.value=1.15")).toBeInTheDocument();
+    // Candidates load in a separate request after the run detail shell; wait
+    // for the ranking rather than racing the second fetch.
+    expect(await screen.findByText("px.params.value=1.15")).toBeInTheDocument();
     expect(screen.getByText("original parameters")).toBeInTheDocument();
     expect(
       screen.getByText(/undefined metrics are never ranked as zero/i),

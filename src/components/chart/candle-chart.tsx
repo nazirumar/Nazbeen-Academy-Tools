@@ -51,6 +51,8 @@ export interface CandleChartProps {
   visible: Record<string, boolean>
   /** Whether the newest candle is forming (drives the honest label). */
   includesForming: boolean
+  /** Keep the viewport pinned to the newest candle (market replay). */
+  followLatest?: boolean
   heightClass?: string
 }
 
@@ -229,6 +231,7 @@ export function CandleChart({
   overlays,
   visible,
   includesForming,
+  followLatest = false,
   heightClass = 'h-[420px]',
 }: CandleChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null)
@@ -418,6 +421,7 @@ export function CandleChart({
       // History changed before the tail, or the window shrank: full resync
       // (no fitContent — the user's zoom/pan is preserved).
       series.setData(toChartData(candles))
+      if (followLatest) chart.timeScale().fitContent()
     } else {
       // Tail-only change: the last old candle changed (closed over forming)
       // and/or new candles arrived — push each tail candle incrementally.
@@ -431,9 +435,10 @@ export function CandleChart({
           close: c.close,
         })
       }
+      if (followLatest) chart.timeScale().scrollToRealTime()
     }
     appliedRef.current = { key: seriesKey, candles }
-  }, [candles, seriesKey])
+  }, [candles, seriesKey, followLatest])
 
   // ---------------------------------------------------------- overlays
   const chartMarkers = useMemo(() => toChartMarkers(overlays, visible), [overlays, visible])

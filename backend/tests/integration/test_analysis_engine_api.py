@@ -356,6 +356,9 @@ class TestRunAnalysis:
 
 
 class TestEngineRefusal:
+    @pytest.mark.parametrize(
+        "app_client", [{"MT5_ENABLED": "false"}], indirect=True
+    )
     async def test_disconnected_provider_refuses_with_503(self, app_client):
         """No fake MT5 installed: provider honestly reports disconnection.
 
@@ -429,6 +432,9 @@ class TestEngineMeta:
         assert data["checks"]["rule_registry"]["available"] >= 12
         assert data["checks"]["database"]["status"] == "up"
 
+    @pytest.mark.parametrize(
+        "app_client", [{"MT5_ENABLED": "false"}], indirect=True
+    )
     async def test_readiness_without_provider(self, app_client):
         data = (await app_client.get("/api/v1/analysis/readiness")).json()["data"]
         assert data["ready"] is True  # engine usable (DB + registry)
