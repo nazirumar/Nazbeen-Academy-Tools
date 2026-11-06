@@ -8,9 +8,11 @@
  *   data fresh;
  * - "Stale" when the backend itself flagged staleness (its data-quality
  *   gate, not a frontend guess);
+ * - "Partial data" when the backend returned real candles but flagged the
+ *   series as short or incomplete — the chart still shows those candles;
  * - "Not connected" when the last request failed — the chart keeps showing
  *   the last REAL candles but the label stops claiming liveness;
- * - "No data" when the terminal answered but has no candles.
+ * - "No data" when the terminal answered but has no candles at all.
  */
 
 import { useEffect, useState } from 'react'
@@ -43,6 +45,11 @@ const STATUS_META: Record<
   stale: {
     label: 'Stale data',
     className: 'bg-orange-100 text-orange-700 dark:bg-orange-900/50 dark:text-orange-300',
+    icon: <AlertTriangle className="h-3.5 w-3.5" aria-hidden />,
+  },
+  partial: {
+    label: 'Partial data',
+    className: 'bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300',
     icon: <AlertTriangle className="h-3.5 w-3.5" aria-hidden />,
   },
   no_data: {

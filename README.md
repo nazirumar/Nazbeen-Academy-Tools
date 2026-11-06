@@ -18,11 +18,13 @@ analysis:
   visibility-aware pausing, duplicate/out-of-order protection
   (closed candles replace their forming predecessor), at most one request
   in flight, and full cleanup on unmount;
-* honest **connection & freshness indicators**: Live / Stale / Not connected /
-  No candles / Failed — "live" is claimed only while the last fetch
-  succeeded and the backend's own data-quality gate says the data is fresh;
-  after a failure the last REAL candles stay visible but the chart stops
-  claiming to be live;
+* honest **connection & freshness indicators**: Live / Partial data / Stale /
+  Not connected / No candles / Failed — "live" is claimed only while the last
+  fetch succeeded and the backend's own data-quality gate says the data is
+  fresh; "partial" means real candles were returned but the backend flagged
+  short history or excluded invalid rows, so they stay on the chart with the
+  warning visible; after a failure the last REAL candles stay visible but the
+  chart stops claiming to be live;
 * **chart overlays derived exclusively from the analysis engine's output**
   (`src/lib/chart/overlay-model.ts`): swing highs/lows with confirmation
   timing, HH/LH/HL/LL labels, BOS segments, MSS/CHoCH levels and FVG zones

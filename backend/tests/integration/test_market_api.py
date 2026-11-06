@@ -147,10 +147,15 @@ class TestMarketCandles:
         data = candles_payload(res)
         assert data["closed_only"] is True
         assert data["includes_forming"] is False
+        # 50 seeded rows easily cover 20 closed candles: the extra raw fetch
+        # compensates for the newest (forming) row instead of reporting 19.
+        assert data["count"] == 20
+        assert data["data_status"] == "ok"
         assert all(c["forming"] is False for c in data["candles"])
         assert any(
             w["code"] == "FORMING_CANDLE_EXCLUDED" for w in data["warnings"]
         )
+        assert not any(w["code"] == "INSUFFICIENT_HISTORY" for w in data["warnings"])
 
     async def test_invalid_timeframe_structured_422(self, app_client, seeded_history) -> None:
         res = await app_client.get(

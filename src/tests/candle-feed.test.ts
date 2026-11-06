@@ -146,6 +146,30 @@ describe("useCandleFeed", () => {
     unmount();
   });
 
+  it("keeps real candles visible when history is short", async () => {
+    getMock.mockResolvedValue(
+      series([candle(1000, 1.0)], {
+        data_status: "insufficient",
+        count: 1,
+        requested_count: 100,
+        warnings: [
+          {
+            code: "INSUFFICIENT_HISTORY",
+            severity: "warning",
+            message: "Only 1 validated candle(s) available but 100 were requested.",
+          },
+        ],
+      }),
+    );
+    const { result, unmount } = renderHook(() =>
+      useCandleFeed({ symbol: "EURUSD", timeframe: "M1", limit: 100, closedOnly: true, intervalMs: 0 }),
+    );
+    await waitFor(() => expect(feedOf(result).status).toBe("partial"));
+    expect(feedOf(result).candles).toHaveLength(1);
+    expect(feedOf(result).dataStatus).toBe("insufficient");
+    unmount();
+  });
+
   it("goes disconnected on backend failure but KEEPS the last real candles", async () => {
     getMock.mockResolvedValueOnce(series([candle(1000, 1.0)]));
     const { result, unmount } = renderHook(() =>

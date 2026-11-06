@@ -151,8 +151,15 @@ class MT5Provider:
                 return cached
 
         # ---- 2. fetch from the terminal ----------------------------------------
+        # When closed-only is requested, the newest raw candle is usually the
+        # still-forming one and will be excluded by validation. Ask for one
+        # extra row so a full ``limit`` of CLOSED candles can still be returned
+        # instead of reporting a false one-candle shortfall.
+        fetch_count = limit + 1 if closed_only else limit
         try:
-            records = await adapter.run(adapter.sync_candles, symbol, timeframe, limit)
+            records = await adapter.run(
+                adapter.sync_candles, symbol, timeframe, fetch_count
+            )
         except MT5SymbolError as exc:
             raise SymbolNotFoundError(str(exc)) from exc
         except (MT5DisabledError, MT5NotAvailableError, MT5ConnectionError, MT5TimeoutError) as exc:
@@ -300,6 +307,15 @@ class MT5Provider:
         limit: int,
         closed_only: bool,
     ) -> CandleSeries:
+        # ``closed_only`` fetches one extra raw row to cover the forming candle,
+        # so the validated series can contain ``limit + 1`` closed candles when
+        # the newest raw row was already closed. Always honour the requested
+        # maximum in the response.
+        rows = (
+            validation.candles[-limit:]
+            if len(validation.candles) > limit
+            else validation.candles
+        )
         points = [
             CandlePoint(
                 time=row["time"],
@@ -311,7 +327,7 @@ class MT5Provider:
                 volume=row["volume"],
                 forming=row["forming"],
             )
-            for row in validation.candles
+            for row in rows
         ]
         closed_times = [p.time for p in points if not p.forming]
         newest_closed = closed_times[-1] if closed_times else None

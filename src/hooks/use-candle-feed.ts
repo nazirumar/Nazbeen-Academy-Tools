@@ -14,7 +14,9 @@
  * - at most one request is in flight (no pile-ups on slow backends);
  * - the connection state is honest: `disconnected` after failures, never
  *   "live" while the last request errored; `stale` is derived from the
- *   backend's own data-status, not from frontend guesses;
+ *   backend's own data-status, not from frontend guesses; a backend
+ *   `partial`/`insufficient` status with usable candles is shown as
+ *   `partial`, never as "No candles";
  * - the forming candle is preserved as `forming: true` — the chart labels
  *   it and analysis defaults exclude it.
  */
@@ -29,6 +31,7 @@ export type FeedStatus =
   | 'loading'
   | 'live'
   | 'stale'
+  | 'partial'
   | 'no_data'
   | 'disconnected'
   | 'error'
@@ -105,8 +108,12 @@ function sameCandle(a: CandlePoint, b: CandlePoint): boolean {
 function statusFromSeries(series: CandleSeries): FeedStatus {
   const staleWarning = series.warnings.some((w) => w.code === 'STALE_DATA')
   if (staleWarning || series.data_status === 'stale') return 'stale'
-  if (series.data_status === 'empty' || series.data_status === 'insufficient') {
-    return 'no_data'
+  if (series.data_status === 'empty' || series.count === 0) return 'no_data'
+  // The backend is honest when it could not fill the full request (short
+  // history, or malformed rows were excluded). That is NOT the same as having
+  // no candles: the valid candles must stay on the chart and be labelled.
+  if (series.data_status === 'partial' || series.data_status === 'insufficient') {
+    return 'partial'
   }
   return 'live'
 }

@@ -142,6 +142,41 @@ class TestCandleResponses:
         assert series.newest_closed_time == series.candles[-2].time
         assert series.warnings  # forming-candle info present
 
+    async def test_closed_only_fetches_extra_to_cover_forming_candle(
+        self, provider, fake_mt5
+    ) -> None:
+        """200 closed candles must not become 199 just because #201 is forming."""
+
+        seed_history(fake_mt5, count=11)
+        series = await provider.get_candles("EURUSD", "M1", 10, closed_only=True)
+        assert series.count == 10
+        assert series.requested_count == 10
+        assert series.data_status == "ok"
+        assert all(not candle.forming for candle in series.candles)
+        assert any(w["code"] == "FORMING_CANDLE_EXCLUDED" for w in series.warnings)
+        assert not any(w["code"] == "INSUFFICIENT_HISTORY" for w in series.warnings)
+
+    async def test_closed_only_trims_extra_row_when_nothing_is_forming(
+        self, provider, fake_mt5
+    ) -> None:
+        base = int(time.time()) // 60 * 60
+        seed_history(fake_mt5, count=21, end=base - 60)
+        series = await provider.get_candles("EURUSD", "M1", 20, closed_only=True)
+        assert series.count == 20
+        assert series.data_status == "ok"
+        assert all(not candle.forming for candle in series.candles)
+
+    async def test_closed_only_short_history_stays_insufficient(
+        self, provider, fake_mt5
+    ) -> None:
+        seed_history(fake_mt5, count=10)
+        series = await provider.get_candles("EURUSD", "M1", 10, closed_only=True)
+        # One of the ten rows is forming, so only nine closed candles exist.
+        # The platform must report that honestly instead of inventing a tenth.
+        assert series.count == 9
+        assert series.data_status == "insufficient"
+        assert any(w["code"] == "INSUFFICIENT_HISTORY" for w in series.warnings)
+
     async def test_unknown_symbol_maps_to_404(self, provider, fake_mt5) -> None:
         with pytest.raises(SymbolNotFoundError):
             await provider.get_candles("NOPEUSD", "M1", 5)
